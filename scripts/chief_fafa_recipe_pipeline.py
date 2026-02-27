@@ -1006,6 +1006,28 @@ def normalize_recipe_url(url: str) -> str:
             video_id = path.split("/embed/", 1)[1].split("/", 1)[0].strip()
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id}"
+    if "instagram.com" in netloc:
+        netloc = "www.instagram.com"
+        path = (p.path or "/").strip("/")
+        parts = [x for x in path.split("/") if x]
+        if len(parts) >= 2 and parts[0] in {"reel", "p", "tv"}:
+            return f"https://{netloc}/{parts[0]}/{parts[1]}/"
+        if len(parts) >= 2 and parts[0] == "stories":
+            return f"https://{netloc}/stories/{parts[1]}/"
+    if "facebook.com" in netloc:
+        netloc = "www.facebook.com"
+        path = (p.path or "/").strip("/")
+        parts = [x for x in path.split("/") if x]
+        q = dict(parse_qsl(p.query, keep_blank_values=False))
+        if parts and parts[0] in {"reel", "watch"}:
+            if parts[0] == "reel" and len(parts) >= 2:
+                return f"https://{netloc}/reel/{parts[1]}"
+            if parts[0] == "watch" and q.get("v"):
+                return f"https://{netloc}/watch?v={q.get('v','').strip()}"
+        if len(parts) >= 3 and parts[-2] in {"videos", "reels"}:
+            return f"https://{netloc}/{parts[-2]}/{parts[-1]}"
+        if q.get("v"):
+            return f"https://{netloc}/watch?v={q.get('v','').strip()}"
 
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
@@ -1030,6 +1052,108 @@ def normalize_recipe_url(url: str) -> str:
     if query:
         rebuilt += f"?{query}"
     return rebuilt
+
+
+def canonical_host_from_url(url: str) -> str:
+    norm = normalize_recipe_url(url)
+    if not norm:
+        return ""
+    try:
+        host = urlparse(norm).netloc.lower()
+    except Exception:
+        return ""
+    for pref in ("www.", "m.", "mbasic.", "mobile."):
+        if host.startswith(pref):
+            host = host[len(pref) :]
+            break
+    return host
+
+
+def read_json_file_safely(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_json_file_safely(path: Path, data: Any) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def detect_and_record_new_url_host(url: str) -> Tuple[bool, str]:
+    host = canonical_host_from_url(url)
+    if not host:
+        return False, ""
+    hosts_path = Path(
+        read_env_value(
+            "CHIEF_FAFA_SEEN_HOSTS_FILE",
+            "/home/felixlee/Desktop/chief-fafa/.pi/seen_url_hosts.json",
+        )
+    )
+    data = read_json_file_safely(hosts_path)
+    if not isinstance(data, dict):
+        data = {"hosts": []}
+    hosts = data.get("hosts", [])
+    if not isinstance(hosts, list):
+        hosts = []
+    known = {str(x).strip().lower() for x in hosts if str(x).strip()}
+    is_new = host not in known
+    if is_new:
+        known.add(host)
+        data["hosts"] = sorted(known)
+        write_json_file_safely(hosts_path, data)
+    return is_new, host
+
+
+def maybe_trigger_auto_review(
+    reason: str,
+    source_url: str,
+    error_message: str = "",
+    input_snippet: str = "",
+) -> str:
+    enabled_raw = read_env_value("CHIEF_FAFA_AUTO_REVIEW_ENABLED", "1").strip().lower()
+    if enabled_raw in {"0", "false", "no", "off"}:
+        return "disabled"
+
+    script_path = Path(
+        read_env_value(
+            "CHIEF_FAFA_AUTO_REVIEW_SCRIPT",
+            "/home/felixlee/Desktop/chief-fafa/scripts/chief_fafa_auto_review.py",
+        )
+    )
+    if not script_path.exists():
+        return "script_missing"
+
+    cmd = [
+        "/usr/bin/python3",
+        str(script_path),
+        "--reason",
+        reason[:120],
+    ]
+    if source_url:
+        cmd.extend(["--source-url", source_url[:500]])
+    if error_message:
+        cmd.extend(["--error", error_message[:1200]])
+    if input_snippet:
+        cmd.extend(["--input-snippet", input_snippet[:1200]])
+
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return "triggered"
+    except Exception as exc:
+        return f"trigger_failed:{exc.__class__.__name__}"
 
 
 def extract_summary_from_report_text(text: str) -> str:
@@ -3310,6 +3434,19 @@ def main() -> None:
         output_dir = Path(tempfile.gettempdir()) / "chief-fafa-notes"
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    initial_input_url = extract_first_url(raw_source)
+    auto_review_triggers: List[str] = []
+    if initial_input_url:
+        is_new_host, host = detect_and_record_new_url_host(initial_input_url)
+        if is_new_host:
+            trigger_state = maybe_trigger_auto_review(
+                reason="new_url_host",
+                source_url=initial_input_url,
+                error_message="",
+                input_snippet=raw_source,
+            )
+            auto_review_triggers.append(f"new_url_host:{host}:{trigger_state}")
+
     if raw_source and looks_like_recipe_enquiry(raw_source):
         lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3334,6 +3471,7 @@ def main() -> None:
                     "google_doc_url": str(lookup.get("google_doc_url", "")).strip(),
                     "error_message": str(lookup.get("error_message", "")).strip(),
                     "lookup": lookup,
+                    "auto_review_triggers": auto_review_triggers,
                     "report_path": str(report_path),
                 }
                 print(json.dumps(brief, ensure_ascii=True, indent=2))
@@ -3344,7 +3482,6 @@ def main() -> None:
             print(f"Report saved: {report_path}")
         return
 
-    initial_input_url = extract_first_url(raw_source)
     if initial_input_url and not args.no_doc and not args.no_keep:
         initial_dup = find_existing_recipe_doc_for_url(initial_input_url, notes_root=output_dir)
         if bool(initial_dup.get("found")) and str(initial_dup.get("doc_url", "")).strip():
@@ -3370,6 +3507,7 @@ def main() -> None:
                     "message": "already exists; skipped duplicate creation",
                 },
                 "duplicate": initial_dup,
+                "auto_review_triggers": auto_review_triggers,
                 "report_path": str(report_path),
             }
             if args.json:
@@ -3477,6 +3615,7 @@ def main() -> None:
         "image_url": source.get("image_url", ""),
         "doc": note_result,
         "note": note_result,
+        "auto_review_triggers": auto_review_triggers,
         "report_path": str(report_path),
         "formats": formats,
     }
@@ -3521,6 +3660,27 @@ def main() -> None:
                 seen_errors.add(msg)
                 deduped_errors.append(msg)
             error_message = " | ".join(deduped_errors).strip()
+
+            source_url_for_review = str(source.get("url", "")).strip() or initial_input_url
+            if source_url_for_review and source_error:
+                trigger_state = maybe_trigger_auto_review(
+                    reason="pipeline_error",
+                    source_url=source_url_for_review,
+                    error_message=source_error,
+                    input_snippet=raw_source,
+                )
+                auto_review_triggers.append(f"pipeline_error:{trigger_state}")
+            elif source_url_for_review and error_message and doc_status == "failed":
+                low = error_message.casefold()
+                if "not configured" not in low:
+                    trigger_state = maybe_trigger_auto_review(
+                        reason="pipeline_error",
+                        source_url=source_url_for_review,
+                        error_message=error_message,
+                        input_snippet=raw_source,
+                    )
+                    auto_review_triggers.append(f"pipeline_error:{trigger_state}")
+
             brief = {
                 "ok": bool(result.get("ok")),
                 "summary": summary,
@@ -3529,6 +3689,7 @@ def main() -> None:
                 "error_message": error_message,
                 "doc": note_result,
                 "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
+                "auto_review_triggers": auto_review_triggers,
                 "report_path": str(report_path),
             }
             print(json.dumps(brief, ensure_ascii=True, indent=2))
