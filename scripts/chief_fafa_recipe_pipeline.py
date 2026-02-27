@@ -980,6 +980,203 @@ def extract_source_url_from_text(text: str) -> str:
     return ""
 
 
+def normalize_recipe_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return raw
+    scheme = (p.scheme or "https").lower()
+    netloc = (p.netloc or "").lower()
+    if netloc.endswith(":80") and scheme == "http":
+        netloc = netloc[:-3]
+    if netloc.endswith(":443") and scheme == "https":
+        netloc = netloc[:-4]
+    path = p.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    kept_query: List[str] = []
+    if p.query:
+        for part in p.query.split("&"):
+            if not part:
+                continue
+            key = part.split("=", 1)[0].strip().lower()
+            if key.startswith("utm_"):
+                continue
+            if key in {"fbclid", "gclid", "igshid", "si", "ref"}:
+                continue
+            kept_query.append(part)
+    query = "&".join(sorted(kept_query))
+    rebuilt = f"{scheme}://{netloc}{path}"
+    if query:
+        rebuilt += f"?{query}"
+    return rebuilt
+
+
+def extract_summary_from_report_text(text: str) -> str:
+    lines = [x.rstrip() for x in str(text or "").splitlines()]
+    for idx, line in enumerate(lines):
+        if normalize_space(line).casefold() == "summary:":
+            for j in range(idx + 1, min(len(lines), idx + 7)):
+                cand = normalize_space(lines[j])
+                if cand:
+                    return cand[:240]
+    return ""
+
+
+def find_existing_doc_in_notes_by_url(source_url: str, notes_root: Path, limit_files: int = 450) -> Dict[str, Any]:
+    norm_url = normalize_recipe_url(source_url)
+    if not norm_url or not is_accessible_dir(notes_root):
+        return {"found": False}
+
+    files = sorted(notes_root.glob("*.md"), key=lambda p: p.stat().st_mtime if is_accessible_file(p) else 0, reverse=True)
+    latest_seen: Dict[str, Any] = {"found": False}
+    for path in files[:limit_files]:
+        if "-enquiry-" in path.name:
+            continue
+        raw = read_text_safely(path, max_chars=200000)
+        if not raw:
+            continue
+        report_url = extract_source_url_from_text(raw)
+        if not report_url:
+            continue
+        if normalize_recipe_url(report_url) != norm_url:
+            continue
+        title = extract_title_from_report_text(raw, path.stem.replace("-", " "))
+        summary = extract_summary_from_report_text(raw)
+        doc_url = extract_doc_url_from_text(raw)
+        candidate = {
+            "found": bool(doc_url),
+            "match_type": "notes_url_match",
+            "title": title,
+            "summary": summary,
+            "source_url": report_url,
+            "normalized_url": norm_url,
+            "doc_url": doc_url,
+            "note_path": str(path),
+            "modified": int(path.stat().st_mtime),
+        }
+        if doc_url:
+            return candidate
+        if not latest_seen.get("note_path"):
+            latest_seen = candidate
+    return latest_seen
+
+
+def google_drive_find_existing_doc_by_source_url(source_url: str, limit: int = 8) -> Tuple[Dict[str, Any], str]:
+    token, err = resolve_docs_access_token()
+    if not token:
+        return {"found": False}, err or "missing Google Docs token"
+
+    norm_url = normalize_recipe_url(source_url)
+    if not norm_url:
+        return {"found": False}, "source url missing"
+    parsed = urlparse(norm_url)
+    host = parsed.netloc.lower()
+    tail = Path(parsed.path).name.strip().lower()
+    terms = [host] if host else []
+    if tail and tail not in terms:
+        terms.append(tail)
+    if not terms:
+        return {"found": False}, "url terms missing"
+
+    clauses = []
+    for term in terms[:2]:
+        esc = escape_drive_query_literal(term)
+        clauses.append(f"fullText contains '{esc}'")
+    query = "mimeType='application/vnd.google-apps.document' and trashed=false and (" + " and ".join(clauses) + ")"
+
+    headers = {"Authorization": f"Bearer {token}"}
+    quota_project = resolve_docs_quota_project()
+    if quota_project:
+        headers["X-Goog-User-Project"] = quota_project
+    params = {
+        "q": query,
+        "spaces": "drive",
+        "pageSize": max(1, min(25, int(limit))),
+        "orderBy": "modifiedTime desc",
+        "fields": "files(id,name,webViewLink,modifiedTime)",
+    }
+    try:
+        resp = requests.get(
+            f"{GOOGLE_DRIVE_API_BASE}",
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.text else {}
+    except Exception as exc:
+        return {"found": False}, f"Google Docs URL search failed ({exc.__class__.__name__}: {exc})"
+    if resp.status_code >= 400:
+        detail = extract_google_api_error(data)
+        return {"found": False}, f"Google Docs URL search HTTP {resp.status_code}: {detail or 'request failed'}"
+
+    files = data.get("files", []) if isinstance(data, dict) else []
+    if not isinstance(files, list):
+        files = []
+    for item in files[:limit]:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("id", "")).strip()
+        if not file_id:
+            continue
+        title = decode_html_text(str(item.get("name", ""))).strip() or "Untitled document"
+        doc_url = str(item.get("webViewLink", "")).strip()
+        if not doc_url:
+            doc_url = f"https://docs.google.com/document/d/{file_id}/edit"
+
+        verified = False
+        try:
+            export_resp = requests.get(
+                f"{GOOGLE_DRIVE_API_BASE}/{file_id}/export",
+                headers=headers,
+                params={"mimeType": "text/plain"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if export_resp.status_code < 400:
+                body = export_resp.text or ""
+                if source_url in body or norm_url in body:
+                    verified = True
+        except Exception:
+            verified = False
+
+        if verified:
+            return (
+                {
+                    "found": True,
+                    "match_type": "google_docs_url_match",
+                    "title": title,
+                    "summary": f"Existing Google Doc matched source URL ({host}).",
+                    "source_url": source_url,
+                    "normalized_url": norm_url,
+                    "doc_url": doc_url,
+                    "note_path": "",
+                    "modified": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                },
+                "",
+            )
+    return {"found": False}, ""
+
+
+def find_existing_recipe_doc_for_url(source_url: str, notes_root: Path) -> Dict[str, Any]:
+    note_hit = find_existing_doc_in_notes_by_url(source_url, notes_root=notes_root)
+    if bool(note_hit.get("found")) and str(note_hit.get("doc_url", "")).strip():
+        return note_hit
+
+    drive_hit, drive_err = google_drive_find_existing_doc_by_source_url(source_url)
+    if bool(drive_hit.get("found")) and str(drive_hit.get("doc_url", "")).strip():
+        return drive_hit
+
+    out = {"found": False}
+    if note_hit.get("note_path"):
+        out["note_hit_without_doc"] = note_hit
+    if drive_err:
+        out["check_error"] = drive_err
+    return out
+
+
 def extract_title_from_report_text(text: str, fallback: str) -> str:
     for line in text.splitlines():
         clean = normalize_space(line)
@@ -2941,6 +3138,23 @@ def format_enquiry_markdown_report(lookup: Dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def format_duplicate_markdown_report(hit: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append(f"Chief Fafa Recipe Duplicate Check - {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append("")
+    lines.append(f"Match type: {hit.get('match_type', '')}")
+    lines.append(f"Title: {hit.get('title', '')}")
+    lines.append(f"Source URL: {hit.get('source_url', '')}")
+    lines.append(f"Google Doc URL: {hit.get('doc_url', '')}")
+    if hit.get("note_path"):
+        lines.append(f"Note path: {hit.get('note_path', '')}")
+    if hit.get("summary"):
+        lines.append("")
+        lines.append("Summary:")
+        lines.append(str(hit.get("summary", "")))
+    return "\n".join(lines).strip() + "\n"
+
+
 def extract_source_payload(url: str) -> Dict[str, Any]:
     final_url, html = fetch_page(url)
     title = extract_title(html)
@@ -3113,6 +3327,41 @@ def main() -> None:
             print(f"Report saved: {report_path}")
         return
 
+    initial_input_url = extract_first_url(raw_source)
+    if initial_input_url and not args.no_doc and not args.no_keep:
+        initial_dup = find_existing_recipe_doc_for_url(initial_input_url, notes_root=output_dir)
+        if bool(initial_dup.get("found")) and str(initial_dup.get("doc_url", "")).strip():
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            slug = slugify(f"duplicate-{initial_dup.get('title', 'recipe')}")
+            report_path = output_dir / f"{stamp}-{slug}.md"
+            report_markdown = format_duplicate_markdown_report(initial_dup)
+            report_path.write_text(report_markdown, encoding="utf-8")
+
+            duplicate_summary = (
+                f"Recipe already exists for this URL. Reusing existing Google Doc: "
+                f"{decode_html_text(str(initial_dup.get('title', 'Recipe')))}."
+            )
+            brief = {
+                "ok": True,
+                "summary": duplicate_summary[:220],
+                "google_doc_status": "exists",
+                "google_doc_url": str(initial_dup.get("doc_url", "")).strip(),
+                "error_message": "",
+                "doc": {
+                    "ok": True,
+                    "url": str(initial_dup.get("doc_url", "")).strip(),
+                    "message": "already exists; skipped duplicate creation",
+                },
+                "duplicate": initial_dup,
+                "report_path": str(report_path),
+            }
+            if args.json:
+                print(json.dumps(brief, ensure_ascii=True, indent=2))
+            else:
+                print(report_markdown)
+                print(f"Report saved: {report_path}")
+            return
+
     if not raw_source:
         source = {
             "url": "",
@@ -3176,9 +3425,23 @@ def main() -> None:
 
     summary_for_doc = human_readable_doc_summary(source, formats)
 
+    duplicate_hit_post_fetch: Dict[str, Any] = {}
+    duplicate_check_error = ""
+    if str(source.get("url", "")).strip() and not validation_error and not args.no_doc and not args.no_keep:
+        post_dup = find_existing_recipe_doc_for_url(str(source.get("url", "")), notes_root=output_dir)
+        if bool(post_dup.get("found")) and str(post_dup.get("doc_url", "")).strip():
+            duplicate_hit_post_fetch = post_dup
+        duplicate_check_error = str(post_dup.get("check_error", "")).strip()
+
     note_result: Dict[str, Any] = {"ok": False, "message": "skipped"}
     if validation_error:
         note_result = {"ok": False, "message": validation_error}
+    elif duplicate_hit_post_fetch:
+        note_result = {
+            "ok": True,
+            "url": str(duplicate_hit_post_fetch.get("doc_url", "")).strip(),
+            "message": "already exists; skipped duplicate creation",
+        }
     elif not args.no_doc and not args.no_keep:
         note_title = f"Chief Fafa - {source.get('title', 'Recipe')}"[:120]
         note_body = build_google_doc_recipe_text(source, summary_for_doc)
@@ -3203,8 +3466,16 @@ def main() -> None:
 
     if args.json:
         if args.json_brief:
-            summary = short_chat_summary(source, formats, source_error)
+            if duplicate_hit_post_fetch:
+                summary = (
+                    f"Recipe already exists for this URL. Reusing existing Google Doc: "
+                    f"{decode_html_text(str(duplicate_hit_post_fetch.get('title', source.get('title', 'Recipe'))))}."
+                )
+            else:
+                summary = short_chat_summary(source, formats, source_error)
             doc_status = "ok" if bool(note_result.get("ok")) else "failed"
+            if duplicate_hit_post_fetch:
+                doc_status = "exists"
             doc_url = str(note_result.get("url", "")).strip()
             error_messages: List[str] = []
             if source_error:
@@ -3220,6 +3491,8 @@ def main() -> None:
             include_ai_err = bool(ai_err) and not ai_err.startswith("OpenAI skipped")
             if include_ai_err and not error_messages:
                 error_messages.append(ai_err)
+            if duplicate_check_error and not duplicate_hit_post_fetch:
+                error_messages.append(duplicate_check_error)
             deduped_errors: List[str] = []
             seen_errors: set[str] = set()
             for item in error_messages:
@@ -3238,6 +3511,7 @@ def main() -> None:
                 "google_doc_url": doc_url,
                 "error_message": error_message,
                 "doc": note_result,
+                "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
                 "report_path": str(report_path),
             }
             print(json.dumps(brief, ensure_ascii=True, indent=2))
