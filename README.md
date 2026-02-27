@@ -57,6 +57,8 @@ Do **not** commit secrets.
 - `GOOGLE_DOCS_REDIRECT_URI` (optional; default `http://127.0.0.1:8788/callback`)
 - `CHIEF_FAFA_OUTPUT_DIR` (optional; default `/home/felixlee/Desktop/chief-fafa/notes`)
 - `CHIEF_FAFA_OPENAI_TIMEOUT_SEC` (optional; timeout tuning)
+- `CHIEF_FAFA_MEMORY_ROOT` (optional; default `/home/felixlee/Desktop/chief-fafa`)
+- `CHIEF_FAFA_OPENCLAW_SESSIONS_DIR` (optional; default `/home/felixlee/.openclaw/agents/chief-fafa/sessions`)
 
 ## Yuen Yuen Weather Agent
 
@@ -113,12 +115,26 @@ python3 scripts/chief_fafa_recipe_pipeline.py "https://example.com/recipe" --jso
 cat recipe.txt | python3 scripts/chief_fafa_recipe_pipeline.py --stdin --json --json-brief
 ```
 
+### Saved-recipe enquiry mode
+
+```bash
+python3 scripts/chief_fafa_recipe_pipeline.py "find my saved black sesame recipe" --json --json-brief
+```
+
+Lookup order:
+
+1. `memory/` + `MEMORY.md` (long-term notes)
+2. Local recipe run reports in `CHIEF_FAFA_OUTPUT_DIR`
+3. OpenClaw conversation history sessions
+4. Google Docs search (Drive API)
+
 ### Behavior summary
 
 - Extracts title, ingredients, methods, media URL from source URL or free text
 - Supports multilingual content handling
 - Generates multi-format content pack (web/Facebook/Instagram/YouTube style)
 - Creates Google Doc note (when Docs credentials are configured)
+- Supports enquiry of previously saved recipes and returns the best matching Google Doc URL when found
 
 ## Google OAuth Helper (Docs/Keep)
 
@@ -143,4 +159,3 @@ It prints env lines to place in your `.env`.
 - Rotate/revoke any token that was shared in chat or logs.
 - Keep `.env`, `credentials/`, `.secrets/`, and `data/` out of git history.
 - Use fine-grained GitHub PATs with minimal scope (`Contents: Read and write` only when needed).
-

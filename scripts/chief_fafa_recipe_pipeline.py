@@ -61,6 +61,61 @@ VIDEO_URL_HINTS = [
     "bilibili.com",
 ]
 
+ENQUIRY_KEYWORDS = [
+    "find recipe",
+    "search recipe",
+    "saved recipe",
+    "previous recipe",
+    "old recipe",
+    "look up recipe",
+    "what did i save",
+    "history",
+    "enquiry",
+    "query",
+    "lookup",
+    "搜尋",
+    "搜索",
+    "查詢",
+    "查找",
+    "之前",
+    "以前",
+    "已存",
+    "食譜",
+    "食谱",
+    "料理",
+    "レシピ",
+    "조회",
+    "검색",
+    "레시피",
+]
+
+ENQUIRY_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "to",
+    "for",
+    "of",
+    "in",
+    "on",
+    "and",
+    "or",
+    "is",
+    "are",
+    "my",
+    "me",
+    "please",
+    "recipe",
+    "recipes",
+    "find",
+    "search",
+    "saved",
+    "previous",
+    "show",
+    "look",
+    "up",
+}
+
 INGREDIENT_HEADING_KEYWORDS = [
     "ingredients",
     "ingredient",
@@ -785,6 +840,398 @@ def extract_first_url(text: str) -> str:
     url = match.group(0).strip()
     url = url.rstrip(").,;!?\"'")
     return url
+
+
+def extract_enquiry_terms(text: str, max_terms: int = 8) -> List[str]:
+    clean = decode_html_text(text).casefold()
+    if not clean:
+        return []
+
+    latin_terms = re.findall(r"[a-z0-9][a-z0-9\-]{1,30}", clean)
+    cjk_terms = re.findall(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]{2,16}", clean)
+    merged = latin_terms + cjk_terms
+    out: List[str] = []
+    seen: set[str] = set()
+    for term in merged:
+        t = term.strip()
+        if not t:
+            continue
+        if len(t) < 2:
+            continue
+        if t in ENQUIRY_STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def score_text_against_terms(text: str, terms: List[str], whole_query: str) -> float:
+    hay = decode_html_text(text).casefold()
+    if not hay:
+        return 0.0
+    score = 0.0
+    for term in terms:
+        if term in hay:
+            count = hay.count(term)
+            score += 1.0 + min(2.0, count * 0.2)
+    whole = normalize_space(whole_query).casefold()
+    if whole and len(whole) >= 3 and whole in hay:
+        score += 2.5
+    return score
+
+
+def choose_snippet(text: str, terms: List[str], max_chars: int = 240) -> str:
+    lines = [normalize_space(x) for x in str(text or "").splitlines() if normalize_space(x)]
+    if not lines:
+        return ""
+    low_terms = [t.casefold() for t in terms if t]
+    def is_machine_line(line: str) -> bool:
+        trimmed = line.strip()
+        return (trimmed.startswith("{") and "\"type\"" in trimmed) or (trimmed.startswith("[") and "{\"" in trimmed)
+
+    for line in lines:
+        low = line.casefold()
+        if is_machine_line(line):
+            continue
+        if any(t in low for t in low_terms):
+            return line[:max_chars]
+    for line in lines:
+        if not is_machine_line(line):
+            return line[:max_chars]
+    return lines[0][:max_chars]
+
+
+def looks_like_structured_recipe_text(text: str) -> bool:
+    lines = [normalize_space(x) for x in str(text or "").splitlines() if normalize_space(x)]
+    if not lines:
+        return False
+    heading_ing = any(is_heading_line(line, INGREDIENT_HEADING_KEYWORDS) for line in lines[:120])
+    heading_steps = any(is_heading_line(line, METHOD_HEADING_KEYWORDS) for line in lines[:120])
+    ingredients, steps = extract_recipe_sections_from_text_blob("\n".join(lines))
+    if heading_ing and heading_steps:
+        return True
+    if len(ingredients) >= 3 and len(steps) >= 2:
+        return True
+    return False
+
+
+def looks_like_recipe_enquiry(text: str) -> bool:
+    raw = unescape(str(text or "")).strip()
+    if not raw:
+        return False
+    if extract_first_url(raw):
+        return False
+    if looks_like_structured_recipe_text(raw):
+        return False
+    clean = decode_html_text(raw)
+    low = clean.casefold()
+    has_keyword = any(k in low for k in ENQUIRY_KEYWORDS)
+    if not has_keyword:
+        has_action = bool(re.search(r"\b(find|search|lookup|look up|show|list)\b", low))
+        has_recipe_context = bool(re.search(r"\b(recipe|recipes|saved|history|previous|old)\b", low))
+        has_keyword = has_action and has_recipe_context
+    has_question = ("?" in clean) or ("？" in clean)
+    return has_keyword or has_question
+
+
+def read_text_safely(path: Path, max_chars: int = 250000) -> str:
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if len(data) > max_chars:
+        return data[:max_chars]
+    return data
+
+
+def is_accessible_dir(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir()
+    except OSError:
+        return False
+
+
+def is_accessible_file(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_file()
+    except OSError:
+        return False
+
+
+def extract_doc_url_from_text(text: str) -> str:
+    m = re.search(r"https://docs\.google\.com/document/d/[A-Za-z0-9_-]+/edit", text)
+    return m.group(0) if m else ""
+
+
+def extract_source_url_from_text(text: str) -> str:
+    for line in text.splitlines():
+        clean = normalize_space(line)
+        low = clean.casefold()
+        if low.startswith("source url:") or low.startswith("original page url:"):
+            parts = clean.split(":", 1)
+            if len(parts) == 2:
+                url = extract_first_url(parts[1])
+                if url:
+                    return url
+    return ""
+
+
+def extract_title_from_report_text(text: str, fallback: str) -> str:
+    for line in text.splitlines():
+        clean = normalize_space(line)
+        low = clean.casefold()
+        if low.startswith("title:") or low.startswith("recipe title:"):
+            parts = clean.split(":", 1)
+            if len(parts) == 2:
+                title = decode_html_text(parts[1])
+                if title:
+                    return title[:180]
+    if fallback:
+        return fallback
+    return "Untitled recipe"
+
+
+def search_markdown_files_for_enquiry(query_text: str, root: Path, source_name: str, limit: int = 8) -> List[Dict[str, Any]]:
+    if not is_accessible_dir(root):
+        return []
+    terms = extract_enquiry_terms(query_text)
+    if not terms:
+        return []
+    files = sorted(root.glob("*.md"), key=lambda p: p.stat().st_mtime if is_accessible_file(p) else 0, reverse=True)
+    out: List[Dict[str, Any]] = []
+    for path in files[:240]:
+        if "-enquiry-" in path.name:
+            continue
+        raw = read_text_safely(path)
+        if not raw:
+            continue
+        score = score_text_against_terms(raw, terms, query_text)
+        if score <= 0:
+            continue
+        title = extract_title_from_report_text(raw, path.stem.replace("-", " "))
+        out.append(
+            {
+                "source": source_name,
+                "score": round(score, 3),
+                "title": title,
+                "doc_url": extract_doc_url_from_text(raw),
+                "source_url": extract_source_url_from_text(raw),
+                "snippet": choose_snippet(raw, terms),
+                "path": str(path),
+                "modified": int(path.stat().st_mtime),
+            }
+        )
+    out.sort(key=lambda x: (float(x.get("score", 0.0)), int(x.get("modified", 0))), reverse=True)
+    return out[:limit]
+
+
+def search_session_history_for_enquiry(query_text: str, sessions_dir: Path, limit: int = 8) -> List[Dict[str, Any]]:
+    if not is_accessible_dir(sessions_dir):
+        return []
+    terms = extract_enquiry_terms(query_text)
+    if not terms:
+        return []
+    files = sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime if is_accessible_file(p) else 0, reverse=True)
+    out: List[Dict[str, Any]] = []
+    for path in files[:220]:
+        raw = read_text_safely(path, max_chars=120000)
+        if not raw:
+            continue
+        score = score_text_against_terms(raw, terms, query_text) * 0.55
+        if score <= 0:
+            continue
+        title = ""
+        m = re.search(r'"summary"\s*:\s*"([^"]+)"', raw)
+        if m:
+            title = decode_html_text(m.group(1))
+        if not title:
+            m = re.search(r'"title"\s*:\s*"([^"]+)"', raw)
+        if m:
+            title = decode_html_text(m.group(1))
+        if not title:
+            title = path.stem
+        out.append(
+            {
+                "source": "conversation_history",
+                "score": round(score, 3),
+                "title": title[:180],
+                "doc_url": extract_doc_url_from_text(raw),
+                "source_url": extract_first_url(raw),
+                "snippet": choose_snippet(raw, terms),
+                "path": str(path),
+                "modified": int(path.stat().st_mtime),
+            }
+        )
+    out.sort(key=lambda x: (float(x.get("score", 0.0)), int(x.get("modified", 0))), reverse=True)
+    return out[:limit]
+
+
+def resolve_docs_quota_project() -> str:
+    return read_env_value(
+        "GOOGLE_DOCS_QUOTA_PROJECT",
+        read_env_value("GOOGLE_KEEP_QUOTA_PROJECT", ""),
+    )
+
+
+def escape_drive_query_literal(text: str) -> str:
+    return str(text or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def google_drive_search_docs(query_text: str, limit: int = 8) -> Tuple[List[Dict[str, Any]], str]:
+    token, err = resolve_docs_access_token()
+    if not token:
+        return [], err or "missing Google Docs token"
+
+    terms = extract_enquiry_terms(query_text)
+    if not terms:
+        clean = normalize_space(query_text)
+        if clean:
+            terms = [clean[:32].casefold()]
+    if not terms:
+        return [], "query terms missing"
+
+    clauses = []
+    for term in terms[:4]:
+        esc = escape_drive_query_literal(term)
+        clauses.append(f"name contains '{esc}' or fullText contains '{esc}'")
+    query = "mimeType='application/vnd.google-apps.document' and trashed=false and (" + " or ".join(clauses) + ")"
+
+    headers = {"Authorization": f"Bearer {token}"}
+    quota_project = resolve_docs_quota_project()
+    if quota_project:
+        headers["X-Goog-User-Project"] = quota_project
+    params = {
+        "q": query,
+        "spaces": "drive",
+        "pageSize": max(1, min(20, int(limit))),
+        "orderBy": "modifiedTime desc",
+        "fields": "files(id,name,webViewLink,modifiedTime)",
+    }
+    try:
+        resp = requests.get(
+            f"{GOOGLE_DRIVE_API_BASE}",
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.text else {}
+    except Exception as exc:
+        return [], f"Google Docs search failed ({exc.__class__.__name__}: {exc})"
+    if resp.status_code >= 400:
+        detail = extract_google_api_error(data)
+        return [], f"Google Docs search HTTP {resp.status_code}: {detail or 'request failed'}"
+    files = data.get("files", []) if isinstance(data, dict) else []
+    out: List[Dict[str, Any]] = []
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, dict):
+            continue
+        title = decode_html_text(str(item.get("name", ""))).strip() or "Untitled document"
+        out.append(
+            {
+                "source": "google_docs",
+                "score": score_text_against_terms(title, terms, query_text),
+                "title": title[:180],
+                "doc_url": str(item.get("webViewLink", "")).strip(),
+                "source_url": "",
+                "snippet": f"Google Doc: {title}",
+                "path": "",
+                "modified": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+            }
+        )
+    out.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return out[:limit], ""
+
+
+def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
+    notes_root = output_dir
+    memory_root = Path(read_env_value("CHIEF_FAFA_MEMORY_ROOT", "/home/felixlee/Desktop/chief-fafa"))
+    memory_dir = memory_root / "memory"
+    memory_file = memory_root / "MEMORY.md"
+    sessions_dir = Path(
+        read_env_value(
+            "CHIEF_FAFA_OPENCLAW_SESSIONS_DIR",
+            "/home/felixlee/.openclaw/agents/chief-fafa/sessions",
+        )
+    )
+
+    memory_hits = search_markdown_files_for_enquiry(query_text, memory_dir, "memory_daily", limit=5)
+    if is_accessible_file(memory_file):
+        memory_single = search_markdown_files_for_enquiry(query_text, memory_file.parent, "memory", limit=5)
+        # Keep only MEMORY.md entries from this call.
+        memory_hits.extend([x for x in memory_single if Path(str(x.get("path", ""))).name == "MEMORY.md"])
+    note_hits = search_markdown_files_for_enquiry(query_text, notes_root, "notes", limit=8)
+    history_hits = search_session_history_for_enquiry(query_text, sessions_dir, limit=8)
+    docs_hits, docs_err = google_drive_search_docs(query_text, limit=8)
+
+    source_rank = {"memory": 4, "memory_daily": 4, "notes": 3, "conversation_history": 2, "google_docs": 1}
+
+    def ranked_key(item: Dict[str, Any]) -> Tuple[int, float, int]:
+        src = str(item.get("source", ""))
+        return (
+            int(source_rank.get(src, 0)),
+            float(item.get("score", 0.0)),
+            int(item.get("modified", 0)),
+        )
+
+    all_local = memory_hits + note_hits + history_hits
+    all_local.sort(key=ranked_key, reverse=True)
+    deduped: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    docs_hits.sort(key=ranked_key, reverse=True)
+    for item in all_local + docs_hits:
+        key = (str(item.get("doc_url", "")) + "|" + str(item.get("title", "")).casefold()).strip("|")
+        if not key:
+            key = str(item.get("path", ""))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(item)
+        if len(deduped) >= 12:
+            break
+
+    top_doc_url = ""
+    for item in deduped:
+        doc_url = str(item.get("doc_url", "")).strip()
+        if doc_url:
+            top_doc_url = doc_url
+            break
+
+    top_titles = [str(x.get("title", "")).strip() for x in deduped[:3] if str(x.get("title", "")).strip()]
+    if deduped:
+        summary = f"Found {len(deduped)} matching saved recipes for '{normalize_space(query_text)[:60]}'."
+        if top_titles:
+            summary += f" Top match: {top_titles[0]}."
+    else:
+        summary = f"No saved recipe matched '{normalize_space(query_text)[:60]}' in memory/history or Google Docs."
+
+    err_parts: List[str] = []
+    if docs_err:
+        err_parts.append(docs_err)
+    error_message = " | ".join(err_parts).strip()
+    doc_status = "found" if bool(top_doc_url) else "not_found"
+    if doc_status == "not_found" and docs_err and not deduped:
+        doc_status = "failed"
+
+    return {
+        "ok": True,
+        "mode": "enquiry",
+        "query": normalize_space(query_text),
+        "summary": summary[:220],
+        "google_doc_status": doc_status,
+        "google_doc_url": top_doc_url,
+        "error_message": error_message,
+        "results": deduped,
+        "source_counts": {
+            "memory": len(memory_hits),
+            "notes": len(note_hits),
+            "conversation_history": len(history_hits),
+            "google_docs": len(docs_hits),
+        },
+    }
 
 
 def infer_text_language_label(text: str) -> str:
@@ -2462,6 +2909,38 @@ def format_markdown_report(source: Dict[str, Any], summary_text: str, note_resul
     return "\n".join(lines).strip() + "\n"
 
 
+def format_enquiry_markdown_report(lookup: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append(f"Chief Fafa Recipe Enquiry - {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append("")
+    lines.append(f"Query: {lookup.get('query', '')}")
+    lines.append(f"Summary: {lookup.get('summary', '')}")
+    lines.append(f"Google Doc status: {lookup.get('google_doc_status', 'not_found')}")
+    lines.append(f"Google Doc URL: {lookup.get('google_doc_url', '')}")
+    if lookup.get("error_message"):
+        lines.append(f"Error: {lookup.get('error_message')}")
+    lines.append("")
+    lines.append("Matches:")
+    results = lookup.get("results", [])
+    if isinstance(results, list) and results:
+        for item in results[:8]:
+            title = decode_html_text(str(item.get("title", ""))).strip() or "Untitled"
+            source = str(item.get("source", "")).strip() or "unknown"
+            doc_url = str(item.get("doc_url", "")).strip()
+            source_url = str(item.get("source_url", "")).strip()
+            snippet = decode_html_text(str(item.get("snippet", ""))).strip()
+            lines.append(f"- [{source}] {title}")
+            if doc_url:
+                lines.append(f"  Doc: {doc_url}")
+            if source_url:
+                lines.append(f"  Source: {source_url}")
+            if snippet:
+                lines.append(f"  Note: {snippet}")
+    else:
+        lines.append("- No matches")
+    return "\n".join(lines).strip() + "\n"
+
+
 def extract_source_payload(url: str) -> Dict[str, Any]:
     final_url, html = fetch_page(url)
     title = extract_title(html)
@@ -2593,6 +3072,47 @@ def main() -> None:
         if stdin_payload and stdin_payload.strip():
             raw_source = stdin_payload.strip()
 
+    output_dir = Path(args.output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        output_dir = Path(tempfile.gettempdir()) / "chief-fafa-notes"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    if raw_source and looks_like_recipe_enquiry(raw_source):
+        lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        slug = slugify(f"enquiry-{lookup.get('query', '')}")
+        report_path = output_dir / f"{stamp}-{slug}.md"
+        report_markdown = format_enquiry_markdown_report(lookup)
+        report_path.write_text(report_markdown, encoding="utf-8")
+
+        lookup_result = {
+            "ok": bool(lookup.get("ok", True)),
+            "mode": "enquiry",
+            "query": lookup.get("query", ""),
+            "report_path": str(report_path),
+            "lookup": lookup,
+        }
+        if args.json:
+            if args.json_brief:
+                brief = {
+                    "ok": bool(lookup_result.get("ok")),
+                    "summary": str(lookup.get("summary", "")).strip(),
+                    "google_doc_status": str(lookup.get("google_doc_status", "not_found")).strip(),
+                    "google_doc_url": str(lookup.get("google_doc_url", "")).strip(),
+                    "error_message": str(lookup.get("error_message", "")).strip(),
+                    "lookup": lookup,
+                    "report_path": str(report_path),
+                }
+                print(json.dumps(brief, ensure_ascii=True, indent=2))
+            else:
+                print(json.dumps(lookup_result, ensure_ascii=True, indent=2))
+        else:
+            print(report_markdown)
+            print(f"Report saved: {report_path}")
+        return
+
     if not raw_source:
         source = {
             "url": "",
@@ -2665,8 +3185,6 @@ def main() -> None:
         note_result = create_google_doc_note(note_title, note_body, str(source.get("image_url", "")))
 
     report_markdown = format_markdown_report(source, summary_for_doc, note_result)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     slug = slugify(str(source.get("title", "recipe")))
     report_path = output_dir / f"{stamp}-{slug}.md"
