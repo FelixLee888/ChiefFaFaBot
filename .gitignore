@@ -2,10 +2,15 @@
 .secrets/
 credentials/
 notes/
-memory/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.swp
 .DS_Store
+
+# Allow committed exported history snapshots
+!history/
+!history/README.md
+!history/notes/
+!history/notes/*.md
