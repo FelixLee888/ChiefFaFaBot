@@ -26,7 +26,7 @@ import time
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
@@ -990,6 +990,23 @@ def normalize_recipe_url(url: str) -> str:
         return raw
     scheme = (p.scheme or "https").lower()
     netloc = (p.netloc or "").lower()
+
+    # Canonicalize YouTube variants to reduce duplicate recipe docs for the same video.
+    if netloc in {"youtu.be", "www.youtu.be"}:
+        video_id = p.path.strip("/").split("/")[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if netloc.endswith("youtube.com"):
+        path = p.path or "/"
+        q = dict(parse_qsl(p.query, keep_blank_values=False))
+        video_id = q.get("v", "").strip()
+        if not video_id and path.startswith("/shorts/"):
+            video_id = path.split("/shorts/", 1)[1].split("/", 1)[0].strip()
+        if not video_id and path.startswith("/embed/"):
+            video_id = path.split("/embed/", 1)[1].split("/", 1)[0].strip()
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     if netloc.endswith(":443") and scheme == "https":

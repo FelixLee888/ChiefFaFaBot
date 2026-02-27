@@ -30,6 +30,12 @@ After running the command:
 6. If budget is exceeded, kill the process and reply with timeout error in the 4-line format.
 7. Never send placeholder statuses like "Pending" or "temporary hiccup" while the process is still running.
 
+
+## Video URL Policy
+YouTube/Instagram/TikTok/Facebook video URLs are valid recipe sources for this workflow.
+Never reject a URL only because it is a video link.
+Always run the pipeline command first for video URLs.
+
 ## Validation Behavior
 If input is recipe text (no URL), the pipeline validates:
 - recipe name
