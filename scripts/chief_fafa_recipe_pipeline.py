@@ -41,6 +41,10 @@ DOCS_API_CREATE_URL = "https://docs.googleapis.com/v1/documents"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id"
 GOOGLE_DRIVE_API_BASE = "https://www.googleapis.com/drive/v3/files"
+GOOGLE_DOC_URL_RE = re.compile(
+    r"https://docs\.google\.com/document/d/([A-Za-z0-9_-]+)(?:/[^\s)\]]*)?",
+    flags=re.IGNORECASE,
+)
 MAX_EMBED_IMAGE_BYTES = 8 * 1024 * 1024
 DOCS_SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif"}
 TRANSCRIPT_MAX_CHARS = 24000
@@ -1162,8 +1166,270 @@ def is_accessible_file(path: Path) -> bool:
 
 
 def extract_doc_url_from_text(text: str) -> str:
-    m = re.search(r"https://docs\.google\.com/document/d/[A-Za-z0-9_-]+/edit", text)
-    return m.group(0) if m else ""
+    urls = extract_doc_urls_from_text(text)
+    return urls[0] if urls else ""
+
+
+def extract_doc_urls_from_text(text: str) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for match in GOOGLE_DOC_URL_RE.finditer(str(text or "")):
+        doc_id = str(match.group(1) or "").strip()
+        if not doc_id:
+            continue
+        url = canonical_google_doc_url(doc_id)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def extract_google_doc_id(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    m = GOOGLE_DOC_URL_RE.search(raw)
+    if m:
+        return str(m.group(1) or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{20,}", raw):
+        return raw
+    return ""
+
+
+def canonical_google_doc_url(doc_id: str) -> str:
+    clean = str(doc_id or "").strip()
+    if not clean:
+        return ""
+    return f"https://docs.google.com/document/d/{clean}/edit"
+
+
+def validate_google_doc_url(
+    doc_url: str,
+    token: str = "",
+    quota_project: str = "",
+    cache: Optional[Dict[str, Tuple[bool, str, str]]] = None,
+) -> Tuple[bool, str, str]:
+    doc_id = extract_google_doc_id(doc_url)
+    if not doc_id:
+        return False, "", "invalid Google Doc URL"
+
+    if isinstance(cache, dict) and doc_id in cache:
+        return cache[doc_id]
+
+    access_token = token.strip()
+    token_err = ""
+    if not access_token:
+        access_token, token_err = resolve_docs_access_token()
+    if not access_token:
+        return False, "", token_err or "missing Google Docs token"
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    qp = quota_project.strip() or resolve_docs_quota_project()
+    if qp:
+        headers["X-Goog-User-Project"] = qp
+
+    params = {"fields": "id,mimeType,trashed,webViewLink"}
+    try:
+        resp = requests.get(
+            f"{GOOGLE_DRIVE_API_BASE}/{doc_id}",
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.text else {}
+    except Exception as exc:
+        result = (False, "", f"Google Doc validation failed ({exc.__class__.__name__}: {exc})")
+        if isinstance(cache, dict):
+            cache[doc_id] = result
+        return result
+
+    if resp.status_code == 404:
+        result = (False, "", "Google Doc not found")
+        if isinstance(cache, dict):
+            cache[doc_id] = result
+        return result
+    if resp.status_code >= 400:
+        detail = extract_google_api_error(data)
+        result = (False, "", f"Google Doc validation HTTP {resp.status_code}: {detail or 'request failed'}")
+        if isinstance(cache, dict):
+            cache[doc_id] = result
+        return result
+
+    mime_type = str((data or {}).get("mimeType", "")).strip() if isinstance(data, dict) else ""
+    if mime_type and mime_type != "application/vnd.google-apps.document":
+        result = (False, "", f"Google file is not a Doc (mimeType={mime_type})")
+        if isinstance(cache, dict):
+            cache[doc_id] = result
+        return result
+
+    trashed = bool((data or {}).get("trashed")) if isinstance(data, dict) else False
+    if trashed:
+        result = (False, "", "Google Doc is in trash")
+        if isinstance(cache, dict):
+            cache[doc_id] = result
+        return result
+
+    web_view = str((data or {}).get("webViewLink", "")).strip() if isinstance(data, dict) else ""
+    normalized = canonical_google_doc_url(doc_id)
+    if web_view:
+        parsed = urlparse(web_view)
+        if parsed.netloc and parsed.path:
+            normalized = canonical_google_doc_url(doc_id)
+    result = (True, normalized, "")
+    if isinstance(cache, dict):
+        cache[doc_id] = result
+    return result
+
+
+def path_is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def prune_stale_doc_references_in_file(path: Path, stale_urls: List[str]) -> bool:
+    if not stale_urls:
+        return False
+    raw = read_text_safely(path, max_chars=400000)
+    if raw == "":
+        return False
+    lines = raw.splitlines()
+    changed = False
+    kept: List[str] = []
+    for line in lines:
+        if any(url in line for url in stale_urls):
+            changed = True
+            continue
+        kept.append(line)
+    if not changed:
+        return False
+    out_text = "\n".join(kept).rstrip() + "\n"
+    try:
+        path.write_text(out_text, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_stale_doc_references(
+    notes_dirs: List[Path],
+    memory_root: Path,
+    extra_dirs: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
+    token, token_err = resolve_docs_access_token()
+    if not token:
+        return {
+            "ok": False,
+            "message": token_err or "missing Google Docs token",
+            "checked_docs": 0,
+            "missing_docs": 0,
+            "deleted_files": 0,
+            "updated_files": 0,
+        }
+
+    quota_project = resolve_docs_quota_project()
+    cache: Dict[str, Tuple[bool, str, str]] = {}
+    stale_doc_ids: set[str] = set()
+    stale_errors: List[str] = []
+    checked_doc_ids: set[str] = set()
+    deleted_files: List[str] = []
+    updated_files: List[str] = []
+    stale_notes: List[str] = []
+
+    scan_dirs: List[Path] = []
+    for directory in notes_dirs + (extra_dirs or []):
+        if not isinstance(directory, Path):
+            continue
+        if is_accessible_dir(directory):
+            scan_dirs.append(directory)
+
+    memory_files: List[Path] = []
+    mem_file = memory_root / "MEMORY.md"
+    mem_daily = memory_root / "memory"
+    if is_accessible_file(mem_file):
+        memory_files.append(mem_file)
+    if is_accessible_dir(mem_daily):
+        memory_files.extend(sorted(mem_daily.glob("*.md")))
+
+    note_files: List[Path] = []
+    for root in scan_dirs:
+        note_files.extend(sorted(root.glob("*.md")))
+
+    all_files = note_files + memory_files
+    note_dir_set = scan_dirs
+
+    for path in all_files:
+        raw = read_text_safely(path, max_chars=400000)
+        if not raw:
+            continue
+        doc_urls = extract_doc_urls_from_text(raw)
+        if not doc_urls:
+            continue
+
+        stale_urls: List[str] = []
+        valid_urls: List[str] = []
+        for doc_url in doc_urls:
+            doc_id = extract_google_doc_id(doc_url)
+            if doc_id:
+                checked_doc_ids.add(doc_id)
+            ok, normalized_url, err = validate_google_doc_url(
+                doc_url,
+                token=token,
+                quota_project=quota_project,
+                cache=cache,
+            )
+            if ok:
+                valid_urls.append(normalized_url or doc_url)
+            else:
+                stale_urls.append(doc_url)
+                if doc_id:
+                    stale_doc_ids.add(doc_id)
+                if err:
+                    stale_errors.append(f"{path.name}: {err}")
+
+        if not stale_urls:
+            continue
+
+        in_notes = any(path_is_under(path, d) for d in note_dir_set)
+        all_stale = not valid_urls
+        if in_notes and all_stale:
+            try:
+                path.unlink(missing_ok=True)
+                deleted_files.append(str(path))
+                stale_notes.append(str(path))
+                continue
+            except Exception:
+                # Fallback to line prune if delete fails.
+                pass
+
+        if prune_stale_doc_references_in_file(path, stale_urls):
+            updated_files.append(str(path))
+
+    deduped_err: List[str] = []
+    seen_err: set[str] = set()
+    for item in stale_errors:
+        msg = normalize_space(item)
+        if not msg or msg in seen_err:
+            continue
+        seen_err.add(msg)
+        deduped_err.append(msg)
+
+    return {
+        "ok": True,
+        "message": "cleanup completed",
+        "checked_docs": len(checked_doc_ids),
+        "missing_docs": len(stale_doc_ids),
+        "deleted_files": len(deleted_files),
+        "updated_files": len(updated_files),
+        "stale_doc_ids": sorted(stale_doc_ids),
+        "deleted_file_paths": deleted_files,
+        "updated_file_paths": updated_files,
+        "stale_notes": stale_notes,
+        "errors": deduped_err[:30],
+    }
 
 
 def extract_source_url_from_text(text: str) -> str:
@@ -1509,19 +1775,62 @@ def google_drive_find_existing_doc_by_source_url(source_url: str, limit: int = 8
 
 
 def find_existing_recipe_doc_for_url(source_url: str, notes_root: Path) -> Dict[str, Any]:
+    cache: Dict[str, Tuple[bool, str, str]] = {}
+    token, token_err = resolve_docs_access_token()
+    quota_project = resolve_docs_quota_project()
+
     note_hit = find_existing_doc_in_notes_by_url(source_url, notes_root=notes_root)
     if bool(note_hit.get("found")) and str(note_hit.get("doc_url", "")).strip():
-        return note_hit
+        ok, validated_url, _validation_err = validate_google_doc_url(
+            str(note_hit.get("doc_url", "")).strip(),
+            token=token,
+            quota_project=quota_project,
+            cache=cache,
+        )
+        if ok:
+            note_hit["doc_url"] = validated_url
+            return note_hit
+        note_hit["found"] = False
+        note_hit["stale_doc_url"] = str(note_hit.get("doc_url", "")).strip()
 
     drive_hit, drive_err = google_drive_find_existing_doc_by_source_url(source_url)
     if bool(drive_hit.get("found")) and str(drive_hit.get("doc_url", "")).strip():
-        return drive_hit
+        ok, validated_url, validation_err = validate_google_doc_url(
+            str(drive_hit.get("doc_url", "")).strip(),
+            token=token,
+            quota_project=quota_project,
+            cache=cache,
+        )
+        if ok:
+            drive_hit["doc_url"] = validated_url
+            return drive_hit
+        drive_hit["found"] = False
+        drive_hit["stale_doc_url"] = str(drive_hit.get("doc_url", "")).strip()
+        if not drive_err:
+            drive_err = validation_err
 
     out = {"found": False}
     if note_hit.get("note_path"):
         out["note_hit_without_doc"] = note_hit
+    error_parts: List[str] = []
+    if token_err:
+        error_parts.append(token_err)
+    if note_hit.get("stale_doc_url"):
+        error_parts.append("stale note doc URL removed")
+    if drive_hit.get("stale_doc_url"):
+        error_parts.append("stale drive doc URL removed")
     if drive_err:
-        out["check_error"] = drive_err
+        error_parts.append(drive_err)
+    if error_parts:
+        seen_err: set[str] = set()
+        deduped: List[str] = []
+        for item in error_parts:
+            msg = normalize_space(item)
+            if not msg or msg in seen_err:
+                continue
+            seen_err.add(msg)
+            deduped.append(msg)
+        out["check_error"] = " | ".join(deduped)
     return out
 
 
@@ -1738,6 +2047,29 @@ def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
         if len(deduped) >= 12:
             break
 
+    validation_cache: Dict[str, Tuple[bool, str, str]] = {}
+    token, token_err = resolve_docs_access_token()
+    quota_project = resolve_docs_quota_project()
+    stale_doc_count = 0
+    for item in deduped:
+        doc_url = str(item.get("doc_url", "")).strip()
+        if not doc_url:
+            continue
+        ok, normalized_url, v_err = validate_google_doc_url(
+            doc_url,
+            token=token,
+            quota_project=quota_project,
+            cache=validation_cache,
+        )
+        if ok and normalized_url:
+            item["doc_url"] = normalized_url
+        else:
+            item["doc_url"] = ""
+            stale_doc_count += 1
+            prev_note = str(item.get("snippet", "")).strip()
+            if v_err:
+                item["snippet"] = normalize_space(f"{prev_note} (stale doc removed: {v_err})")[:260]
+
     top_doc_url = ""
     for item in deduped:
         doc_url = str(item.get("doc_url", "")).strip()
@@ -1754,8 +2086,12 @@ def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
         summary = f"No saved recipe matched '{normalize_space(query_text)[:60]}' in memory/history or Google Docs."
 
     err_parts: List[str] = []
+    if token_err:
+        err_parts.append(token_err)
     if docs_err:
         err_parts.append(docs_err)
+    if stale_doc_count:
+        err_parts.append(f"removed {stale_doc_count} stale Google Doc link(s)")
     error_message = " | ".join(err_parts).strip()
     doc_status = "found" if bool(top_doc_url) else "not_found"
     if doc_status == "not_found" and docs_err and not deduped:
@@ -3753,6 +4089,28 @@ def main() -> None:
         default=read_env_value("CHIEF_FAFA_OUTPUT_DIR", "/home/felixlee/Desktop/chief-fafa/notes"),
         help="Directory to persist generated markdown reports",
     )
+    parser.add_argument(
+        "--cleanup-stale-doc-links",
+        action="store_true",
+        help="Validate referenced Google Docs and clean stale note/memory links",
+    )
+    parser.add_argument(
+        "--cleanup-memory-root",
+        default=read_env_value("CHIEF_FAFA_MEMORY_ROOT", "/home/felixlee/Desktop/chief-fafa"),
+        help="Memory root that contains MEMORY.md and memory/*.md for cleanup mode",
+    )
+    parser.add_argument(
+        "--cleanup-notes-dir",
+        action="append",
+        default=[],
+        help="Markdown notes directory to clean (can be passed multiple times)",
+    )
+    parser.add_argument(
+        "--cleanup-extra-dir",
+        action="append",
+        default=[],
+        help="Extra markdown directory to clean (for example history/notes)",
+    )
     args = parser.parse_args()
 
     raw_source = str(args.source or "").strip()
@@ -3767,6 +4125,36 @@ def main() -> None:
     except OSError:
         output_dir = Path(tempfile.gettempdir()) / "chief-fafa-notes"
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.cleanup_stale_doc_links:
+        notes_dirs = [Path(p).expanduser() for p in (args.cleanup_notes_dir or []) if str(p).strip()]
+        if not notes_dirs:
+            notes_dirs = [output_dir]
+        extra_dirs = [Path(p).expanduser() for p in (args.cleanup_extra_dir or []) if str(p).strip()]
+        cleanup_result = cleanup_stale_doc_references(
+            notes_dirs=notes_dirs,
+            memory_root=Path(args.cleanup_memory_root).expanduser(),
+            extra_dirs=extra_dirs,
+        )
+        if args.json:
+            print(json.dumps(cleanup_result, ensure_ascii=True, indent=2))
+        else:
+            lines = [
+                f"Cleanup status: {'ok' if cleanup_result.get('ok') else 'failed'}",
+                f"Checked docs: {cleanup_result.get('checked_docs', 0)}",
+                f"Missing docs: {cleanup_result.get('missing_docs', 0)}",
+                f"Deleted files: {cleanup_result.get('deleted_files', 0)}",
+                f"Updated files: {cleanup_result.get('updated_files', 0)}",
+            ]
+            msg = normalize_space(str(cleanup_result.get("message", "")))
+            if msg:
+                lines.append(f"Message: {msg}")
+            errs = cleanup_result.get("errors", [])
+            if isinstance(errs, list) and errs:
+                lines.append("Errors:")
+                lines.extend([f"- {normalize_space(str(e))}" for e in errs[:10] if normalize_space(str(e))])
+            print("\n".join(lines))
+        return
 
     initial_input_url = extract_first_url(raw_source)
     auto_review_triggers: List[str] = []
@@ -3832,6 +4220,22 @@ def main() -> None:
 
     if initial_input_url and not args.no_doc and not args.no_keep:
         initial_dup = find_existing_recipe_doc_for_url(initial_input_url, notes_root=output_dir)
+        if bool(initial_dup.get("found")) and str(initial_dup.get("doc_url", "")).strip():
+            dup_ok, dup_url, dup_err = validate_google_doc_url(str(initial_dup.get("doc_url", "")).strip())
+            if not dup_ok or not dup_url:
+                initial_dup["found"] = False
+                initial_dup["stale_doc_url"] = str(initial_dup.get("doc_url", "")).strip()
+                initial_dup["doc_url"] = ""
+                if dup_err:
+                    prev = str(initial_dup.get("check_error", "")).strip()
+                    initial_dup["check_error"] = (
+                        normalize_space(f"{prev} | duplicate doc validation failed: {dup_err}")
+                        if prev
+                        else f"duplicate doc validation failed: {dup_err}"
+                    )
+            else:
+                initial_dup["doc_url"] = dup_url
+
         if bool(initial_dup.get("found")) and str(initial_dup.get("doc_url", "")).strip():
             stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
             slug = slugify(f"duplicate-{initial_dup.get('title', 'recipe')}")
@@ -3956,6 +4360,24 @@ def main() -> None:
         note_body = build_google_doc_recipe_text(source, summary_for_doc)
         note_result = create_google_doc_note(note_title, note_body, str(source.get("image_url", "")))
 
+    doc_validation_error = ""
+    note_doc_url = str(note_result.get("url", "")).strip()
+    if note_doc_url:
+        ok, normalized_url, v_err = validate_google_doc_url(note_doc_url)
+        if ok and normalized_url:
+            note_result["url"] = normalized_url
+        else:
+            note_result["url"] = ""
+            if bool(note_result.get("ok")):
+                note_result["ok"] = False
+            prev_msg = normalize_space(str(note_result.get("message", "")))
+            reason = v_err or "Google Doc validation failed"
+            if prev_msg:
+                note_result["message"] = f"{prev_msg}; {reason}"
+            else:
+                note_result["message"] = reason
+            doc_validation_error = reason
+
     report_markdown = format_markdown_report(source, summary_for_doc, note_result)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     slug = slugify(str(source.get("title", "recipe")))
@@ -3996,6 +4418,8 @@ def main() -> None:
                 error_messages.append(text_parse_note)
             if validation_error:
                 error_messages.append(validation_error)
+            if doc_validation_error:
+                error_messages.append(doc_validation_error)
             if doc_status != "ok":
                 error_messages.append(str(note_result.get("message", "unknown error")))
             include_ai_err = bool(ai_err) and not ai_err.startswith("OpenAI skipped")
