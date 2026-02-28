@@ -52,6 +52,21 @@ VIDEO_TEXT_MAX_CHARS = 24000
 TRANSCRIPT_MODEL = "gpt-4o-mini-transcribe"
 DOC_IMAGE_MARKER = "[[CHIEF_FAFA_IMAGE_HERE]]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", flags=re.IGNORECASE)
+INLINE_INGREDIENT_STOP_PATTERN = re.compile(
+    r"(?:\b(?:instructions?|method|steps?|directions?)\b|做法|作法|手順|作り方|https?://|#\w)",
+    flags=re.IGNORECASE,
+)
+INLINE_INGREDIENT_PATTERN = re.compile(
+    r"([A-Za-z\u00C0-\u024F\u3400-\u9fff][A-Za-z0-9\u00C0-\u024F\u3400-\u9fff'’()\/,&.+\- ]{0,72}?)\s*"
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cups?|pcs?|pc|克|公斤|毫升|公升|茶匙|湯匙|汤匙|大匙|小匙|"
+    r"條|条|隻|只|個|个|片|塊|块|顆|颗|粒)",
+    flags=re.IGNORECASE,
+)
+INGREDIENT_PLACEHOLDER_PATTERN = re.compile(
+    r"^(?:not clearly detected from source\.?|see source url for full ingredients list\.?|n/a|none|tbd)$",
+    flags=re.IGNORECASE,
+)
 
 VIDEO_URL_HINTS = [
     "youtube.com",
@@ -188,6 +203,15 @@ STOP_SECTION_KEYWORDS = [
     "팁",
     "주의",
     "비고",
+    "comment",
+    "comments",
+    "discussion",
+    "留言",
+    "留言板",
+    "評論",
+    "评论",
+    "回應",
+    "回应",
 ]
 
 ENV_FALLBACK_FILES = [
@@ -256,13 +280,94 @@ def normalize_multiline_text(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+COMMENT_SECTION_START_RE = re.compile(
+    r"(?:^\s*\d+\s+comments?\s*$|\b(?:leave a comment|post a comment|view comments?)\b|(?:發佈留言|发表评论|留言|評論|评论|回覆|回應|回应))",
+    flags=re.IGNORECASE,
+)
+SOCIAL_SHARE_RE = re.compile(
+    r"(?:blogthis|share this|share on|share to|email this|pin(?:terest)?|facebook|twitter|分享至|分享到|以電子郵件傳送這篇文章|回覆\s*刪除|回复\s*删除)",
+    flags=re.IGNORECASE,
+)
+COMMENT_AUTHOR_RE = re.compile(
+    r"^[\w\u3400-\u9fff][\w\u3400-\u9fff .,'’\-]{0,48}\s+\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日.*$",
+    flags=re.IGNORECASE,
+)
+COMMENT_BODY_RE = re.compile(
+    r"(?:thanks for sharing|great post|anonymous said|留下評論|发表留言)",
+    flags=re.IGNORECASE,
+)
+
+
+def is_comment_or_social_line(text: str) -> bool:
+    clean = normalize_space(unescape(text or ""))
+    if not clean:
+        return False
+    if SOCIAL_SHARE_RE.search(clean):
+        return True
+    if COMMENT_AUTHOR_RE.match(clean):
+        return True
+    if COMMENT_BODY_RE.search(clean):
+        return True
+    if re.fullmatch(r"(?:匿名|anonymous)", clean, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"(?:reply|delete|回覆|回复|刪除|删除)", clean, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def is_comment_section_start_line(text: str) -> bool:
+    clean = normalize_space(unescape(text or ""))
+    if not clean:
+        return False
+    if SOCIAL_SHARE_RE.search(clean):
+        return True
+    return bool(COMMENT_SECTION_START_RE.search(clean))
+
+
+def strip_comment_sections_html(html: str) -> str:
+    raw = str(html or "")
+    if not raw:
+        return raw
+    start_markers = [
+        r"<div[^>]+id=[\"']comments[\"']",
+        r"<div[^>]+class=[\"'][^\"']*comments[^\"']*[\"']",
+        r"<a[^>]+name=[\"']comments[\"']",
+        r"<h[1-6][^>]*>\s*comments?\s*</h[1-6]>",
+        r"發佈留言",
+        r"发表评论",
+    ]
+    cut_positions: List[int] = []
+    for marker in start_markers:
+        m = re.search(marker, raw, flags=re.IGNORECASE)
+        if m:
+            cut_positions.append(m.start())
+    if cut_positions:
+        return raw[: min(cut_positions)]
+    return raw
+
+
 def unique_clean_lines(items: Iterable[str], max_items: int = 220) -> List[str]:
     seen: set[str] = set()
     out: List[str] = []
     for item in items:
         line = decode_html_text(item)
-        line = re.sub(r"^[\s\-*•●▪■★☆※\d\.\)\(、:：]+", "", line).strip()
+        line = re.sub(r"^\s*[-*•●▪■★☆※]+\s*", "", line).strip()
+        line = re.sub(r"^\s*\(?\d{1,3}\)?[.)、:：]\s+", "", line).strip()
         if len(line) < 2:
+            continue
+        if is_comment_or_social_line(line):
+            continue
+        if INGREDIENT_PLACEHOLDER_PATTERN.fullmatch(line):
+            continue
+        if re.search(r"(?:^|\s)#\S+", line) and len(re.findall(r"#\S+", line)) >= 2:
+            continue
+        # Skip merged bilingual ingredient lines when they contain multiple qty+unit tokens.
+        qty_hits = re.findall(
+            r"\d+(?:\.\d+)?\s*(?:kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cups?|pcs?|pc|克|公斤|毫升|公升|茶匙|湯匙|汤匙|大匙|小匙|條|条|隻|只|個|个|片|塊|块|顆|颗|粒)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if len(qty_hits) >= 2 and re.search(r"[A-Za-z]", line) and re.search(r"[\u3400-\u9fff]", line):
             continue
         if line.lower().startswith(("http://", "https://")):
             continue
@@ -276,6 +381,78 @@ def unique_clean_lines(items: Iterable[str], max_items: int = 220) -> List[str]:
     return out
 
 
+def normalize_inline_ingredient_name(text: str) -> str:
+    out = normalize_space(unescape(text or ""))
+    out = re.sub(r"^[\s:：,，;；.\-–—()（）\[\]]+", "", out)
+    out = re.sub(r"\b(?:ingredients?|material)\b", "", out, flags=re.IGNORECASE).strip()
+    out = re.sub(r"(?:材料|食材)\s*$", "", out).strip()
+    # If a leading note leaks before ")", keep the token after the last ")"
+    if ")" in out:
+        tail = out.split(")")[-1].strip()
+        if tail:
+            out = tail
+    out = re.sub(r"^\([^)]*\)\s*", "", out).strip()
+    return out
+
+
+def extract_inline_ingredient_items(text: str, max_items: int = 120) -> List[str]:
+    clean = normalize_space(unescape(text or ""))
+    if not clean:
+        return []
+    clean = URL_PATTERN.sub(" ", clean)
+    clean = re.sub(r"#\S+", " ", clean)
+    clean = normalize_space(clean)
+    if not clean:
+        return []
+
+    stop_match = INLINE_INGREDIENT_STOP_PATTERN.search(clean)
+    if stop_match:
+        clean = clean[: stop_match.start()].strip()
+    if not clean:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for match in INLINE_INGREDIENT_PATTERN.finditer(clean):
+        raw_name = normalize_inline_ingredient_name(match.group(1) or "")
+        qty = normalize_space(match.group(2) or "")
+        unit = normalize_space(match.group(3) or "")
+        if not raw_name or not qty or not unit:
+            continue
+        if len(raw_name) > 80:
+            continue
+        if is_noise_or_error_line(raw_name):
+            continue
+        if INGREDIENT_PLACEHOLDER_PATTERN.fullmatch(raw_name):
+            continue
+        item = normalize_space(f"{raw_name} {qty}{unit}")
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def extract_inline_ingredient_segment(text_blob: str) -> str:
+    raw = unescape(text_blob or "")
+    ing_kw = heading_keywords_pattern(INGREDIENT_HEADING_KEYWORDS)
+    m = re.search(
+        rf"(?:{ing_kw})(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*[:：]?\s*(.+)$",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    tail = normalize_space(m.group(1) or "")
+    stop = INLINE_INGREDIENT_STOP_PATTERN.search(tail)
+    if stop:
+        tail = tail[: stop.start()].strip()
+    return tail
+
+
 def split_ingredient_candidates(text: str) -> List[str]:
     raw = unescape(text or "")
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
@@ -283,6 +460,13 @@ def split_ingredient_candidates(text: str) -> List[str]:
     raw = re.sub(r"\s*\*\s*", "\n", raw)
     raw = re.sub(r"[•●▪■★☆※]\s*", "\n", raw)
     parts = [normalize_space(p) for p in raw.split("\n") if normalize_space(p)]
+    if "\n" in raw:
+        return parts
+    inline_items: List[str] = []
+    for part in parts:
+        inline_items.extend(extract_inline_ingredient_items(part))
+    if len(inline_items) >= 2:
+        return unique_clean_lines(inline_items, max_items=260)
     return parts
 
 
@@ -307,6 +491,7 @@ def split_step_candidates(text: str) -> List[str]:
 
 
 def html_to_text_lines(html: str) -> List[str]:
+    html = strip_comment_sections_html(html)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
@@ -315,7 +500,21 @@ def html_to_text_lines(html: str) -> List[str]:
     text = unescape(text)
     text = text.replace("\u00a0", " ")
     lines = [normalize_space(x) for x in text.splitlines()]
-    return [x for x in lines if x]
+
+    out: List[str] = []
+    in_comment_zone = False
+    for line in lines:
+        if not line:
+            continue
+        if in_comment_zone:
+            continue
+        if is_comment_section_start_line(line):
+            in_comment_zone = True
+            continue
+        if is_comment_or_social_line(line):
+            continue
+        out.append(line)
+    return out
 
 
 def is_heading_line(line: str, keywords: List[str]) -> bool:
@@ -363,6 +562,10 @@ def heading_inline_tail(line: str, keywords: List[str]) -> str:
 
 def looks_like_ingredient_line(line: str) -> bool:
     low = line.casefold()
+    if re.search(r"(?:^|\s)#\S+", line) and len(re.findall(r"#\S+", line)) >= 2:
+        return False
+    if any(token in low for token in ["facebook", "instagram", "youtube", "wechat", "contact", "email"]):
+        return False
     if any(k in low for k in INGREDIENT_HEADING_KEYWORDS):
         return False
     if re.search(
@@ -399,6 +602,8 @@ def extract_sections_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]
                 block.extend(split_ingredient_candidates(inline_tail))
             while j < len(lines):
                 cur = lines[j]
+                if is_comment_section_start_line(cur) or is_comment_or_social_line(cur):
+                    break
                 if is_heading_start_line(cur, METHOD_HEADING_KEYWORDS) or is_heading_start_line(cur, STOP_SECTION_KEYWORDS):
                     break
                 if is_heading_start_line(cur, INGREDIENT_HEADING_KEYWORDS):
@@ -421,6 +626,8 @@ def extract_sections_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]
                 block.extend(split_step_candidates(inline_tail))
             while j < len(lines):
                 cur = lines[j]
+                if is_comment_section_start_line(cur) or is_comment_or_social_line(cur):
+                    break
                 if is_heading_start_line(cur, INGREDIENT_HEADING_KEYWORDS) or is_heading_start_line(cur, STOP_SECTION_KEYWORDS):
                     break
                 if is_heading_start_line(cur, METHOD_HEADING_KEYWORDS):
@@ -456,7 +663,7 @@ def extract_sections_by_regex(text_blob: str) -> Tuple[List[str], List[str]]:
     if ingredient_match:
         block = ingredient_match.group(1)
         for part in split_ingredient_candidates(block):
-            if looks_like_ingredient_line(part):
+            if looks_like_ingredient_line(part) and not is_comment_or_social_line(part):
                 ingredients.append(part)
 
     method_match = re.search(
@@ -474,7 +681,7 @@ def extract_sections_by_regex(text_blob: str) -> Tuple[List[str], List[str]]:
             flags=re.IGNORECASE,
         )[0]
         for part in split_step_candidates(stop):
-            if looks_like_step_line(part):
+            if looks_like_step_line(part) and not is_comment_or_social_line(part):
                 steps.append(part)
 
     return unique_clean_lines(ingredients), unique_clean_lines(steps)
@@ -489,12 +696,19 @@ def extract_recipe_sections_from_text_blob(text_blob: str) -> Tuple[List[str], L
     ingredients = unique_clean_lines(section_ingredients + regex_ingredients, max_items=260)
     steps = unique_clean_lines(section_steps + regex_steps, max_items=320)
 
+    if not ingredients:
+        inline_tail = extract_inline_ingredient_segment(text_blob)
+        inline_items = extract_inline_ingredient_items(inline_tail, max_items=260)
+        if inline_items:
+            ingredients = unique_clean_lines(inline_items, max_items=260)
+
     if not steps and lines:
         synthetic_steps = [
             x
             for x in lines
             if looks_like_step_line(x)
             and len(x) <= 280
+            and not is_comment_or_social_line(x)
             and not is_heading_start_line(x, INGREDIENT_HEADING_KEYWORDS)
             and not is_heading_start_line(x, STOP_SECTION_KEYWORDS)
         ]
@@ -806,6 +1020,8 @@ def strip_diagnostic_suffix(text: str) -> str:
 
 
 def is_noise_or_error_line(text: str) -> bool:
+    if is_comment_or_social_line(text):
+        return True
     low = decode_html_text(text).casefold()
     if not low:
         return True
@@ -2802,11 +3018,23 @@ def extract_recipe_from_json_ld(recipe_obj: Dict[str, Any], base_url: str) -> Di
 
 
 def extract_main_text(html: str) -> str:
+    html = strip_comment_sections_html(html)
     scrubbed = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
     scrubbed = re.sub(r"<style[^>]*>.*?</style>", " ", scrubbed, flags=re.IGNORECASE | re.DOTALL)
     paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", scrubbed, flags=re.IGNORECASE | re.DOTALL)
     cleaned = [strip_tags(p) for p in paragraphs]
-    cleaned = [c for c in cleaned if len(c) > 40]
+    filtered: List[str] = []
+    for c in cleaned:
+        line = normalize_space(c)
+        if not line:
+            continue
+        if is_comment_section_start_line(line):
+            break
+        if is_comment_or_social_line(line):
+            continue
+        if len(line) > 40:
+            filtered.append(line)
+    cleaned = filtered
     joined = "\n".join(cleaned[:35])
     return joined[:4500]
 
