@@ -11,6 +11,30 @@ Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, e
 - Google Docs generation with structured recipe format and image embedding (best-effort)
 - Stable chat payload via `--json --json-brief` including `reply_message` for direct Telegram reply
 
+## Infrastructure Diagram
+
+```mermaid
+flowchart LR
+  A["Telegram User / Group"] --> B["Chief Fafa Bot (Telegram)"]
+  B --> C["OpenClaw Gateway"]
+  C --> D["chief_fafa_recipe_pipeline.py"]
+
+  D --> E["URL / Text Intake"]
+  D --> F["Extractor Layer"]
+  F --> G["Web pages / Social / YouTube"]
+  F --> H["yt-dlp metadata & captions (optional)"]
+  F --> I["OpenAI formatting/extraction"]
+
+  D --> J["Memory + Notes + Session History lookup"]
+  D --> K["Google Docs API"]
+  K --> L["Recipe Google Doc"]
+
+  D --> M["JSON Brief (summary/status/url/error)"]
+  M --> C
+  C --> B
+  B --> A
+```
+
 ## Repository Layout
 
 ```text
