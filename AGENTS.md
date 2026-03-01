@@ -75,6 +75,8 @@ If input is saved-recipe enquiry, pipeline searches:
 Always prefer `brief.reply_message` from pipeline JSON.
 - If `brief.reply_message` exists and is non-empty: send it verbatim and nothing else.
 - Never add/remove lines from `brief.reply_message`.
+- Never paraphrase, translate, or rewrite `brief.reply_message` into another language.
+- Reply language must follow the user's input language.
 - This ensures `Error:` is omitted when there is no error.
 
 Fallback only if `brief.reply_message` is missing:

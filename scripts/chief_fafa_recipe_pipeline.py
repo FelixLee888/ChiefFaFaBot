@@ -3007,84 +3007,89 @@ def run_recipe_enquiry(query_text: str, output_dir: Path, locale: str = "en") ->
     }
 
 
+def infer_han_language_label(clean: str) -> str:
+    cantonese_hints = [
+        "佢",
+        "咗",
+        "嘅",
+        "喺",
+        "冇",
+        "啲",
+        "咁",
+        "嚟",
+        "靚",
+        "餸",
+    ]
+    if any(h in clean for h in cantonese_hints):
+        return "cantonese"
+
+    # Include cooking/common Han variants so short recipe queries can still infer zh-Hans vs zh-Hant.
+    traditional_hints = [
+        "體",
+        "麼",
+        "這",
+        "還",
+        "與",
+        "為",
+        "會",
+        "裡",
+        "讓",
+        "點",
+        "後",
+        "國",
+        "發",
+        "麵",
+        "參",
+        "譜",
+        "龍",
+        "雞",
+        "魚",
+        "湯",
+        "飯",
+    ]
+    simplified_hints = [
+        "体",
+        "么",
+        "这",
+        "还",
+        "与",
+        "为",
+        "会",
+        "里",
+        "让",
+        "点",
+        "后",
+        "国",
+        "发",
+        "面",
+        "参",
+        "谱",
+        "龙",
+        "鸡",
+        "鱼",
+        "汤",
+        "饭",
+    ]
+    trad_score = sum(clean.count(x) for x in traditional_hints)
+    simp_score = sum(clean.count(x) for x in simplified_hints)
+    if trad_score > simp_score:
+        return "chinese-traditional"
+    if simp_score > trad_score:
+        return "chinese-simplified"
+    return "chinese"
+
+
 def infer_text_language_label(text: str) -> str:
     clean = decode_html_text(text)
     if not clean:
         return "unknown"
     p = script_profile(clean)
-    if p["hangul"] >= 3:
+    if p["hangul"] >= 2:
         return "korean"
-    if p["hirakata"] >= 3:
+    if p["hirakata"] >= 2:
         return "japanese"
-    if p["han"] >= 3:
-        cantonese_hints = [
-            "佢",
-            "咗",
-            "嘅",
-            "喺",
-            "冇",
-            "啲",
-            "咁",
-            "嚟",
-            "靚",
-            "餸",
-        ]
-        if any(h in clean for h in cantonese_hints):
-            return "cantonese"
-        # Include cooking/common Han variants so short recipe queries can still infer zh-Hans vs zh-Hant.
-        traditional_hints = [
-            "體",
-            "麼",
-            "這",
-            "還",
-            "與",
-            "為",
-            "會",
-            "裡",
-            "讓",
-            "點",
-            "後",
-            "國",
-            "發",
-            "麵",
-            "參",
-            "譜",
-            "龍",
-            "雞",
-            "魚",
-            "湯",
-            "飯",
-        ]
-        simplified_hints = [
-            "体",
-            "么",
-            "这",
-            "还",
-            "与",
-            "为",
-            "会",
-            "里",
-            "让",
-            "点",
-            "后",
-            "国",
-            "发",
-            "面",
-            "参",
-            "谱",
-            "龙",
-            "鸡",
-            "鱼",
-            "汤",
-            "饭",
-        ]
-        trad_score = sum(clean.count(x) for x in traditional_hints)
-        simp_score = sum(clean.count(x) for x in simplified_hints)
-        if trad_score > simp_score:
-            return "chinese-traditional"
-        if simp_score > trad_score:
-            return "chinese-simplified"
-        return "chinese"
+    if p["han"] >= 2:
+        return infer_han_language_label(clean)
     if p["arabic"] >= 3:
         return "arabic"
     if p["cyrillic"] >= 3:
@@ -3114,6 +3119,15 @@ def detect_reply_locale_from_input(raw_text: str, default: str = "en") -> str:
     if not probe:
         return canonical_reply_locale(default)
     detected_label = infer_text_language_label(probe)
+    # Rescue very short CJK inputs like "海參" that can miss the primary threshold.
+    if detected_label in {"unknown", "latin-script", "mixed"}:
+        p = script_profile(probe)
+        if p["hangul"] >= 1:
+            detected_label = "korean"
+        elif p["hirakata"] >= 1:
+            detected_label = "japanese"
+        elif p["han"] >= 1:
+            detected_label = infer_han_language_label(probe)
     return reply_locale_from_language_hint(detected_label, default=default)
 
 
