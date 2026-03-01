@@ -3660,7 +3660,7 @@ def build_formats_with_openai(payload: Dict[str, Any]) -> Tuple[Dict[str, str], 
     if should_skip_openai_generation(payload):
         return {}, "OpenAI skipped (video source already has rich structured content)"
     system_prompt = (
-        "You are Chief Fafa Bot. Produce practical social/media content from recipe source data. "
+        "You are Chef Fafa Bot. Produce practical social/media content from recipe source data. "
         "Return strict JSON with keys: summary, webpage_copy, facebook_post, instagram_post, youtube_video_script. "
         "Use concise, engaging tone. Keep claims grounded in the source only. "
         "Support multilingual inputs (including English, Chinese, Cantonese, Japanese, Korean and mixed text). "

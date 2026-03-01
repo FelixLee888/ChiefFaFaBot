@@ -1,4 +1,4 @@
-# Chief Fafa Bot
+# Chef Fafa Bot
 
 Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, extracts recipe data, and creates a Google Doc note.
 
@@ -15,7 +15,7 @@ Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, e
 
 ```mermaid
 flowchart LR
-  A["Telegram User / Group"] --> B["Chief Fafa Bot (Telegram)"]
+  A["Telegram User / Group"] --> B["Chef Fafa Bot (Telegram)"]
   B --> C["OpenClaw Gateway"]
   C --> D["chief_fafa_recipe_pipeline.py"]
 
