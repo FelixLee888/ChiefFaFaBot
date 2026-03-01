@@ -1218,7 +1218,206 @@ def is_detailed_video_description(text: str) -> bool:
     return line_count >= 10
 
 
-def short_chat_summary(source: Dict[str, Any], formats: Dict[str, str], source_error: str) -> str:
+def canonical_reply_locale(locale: str) -> str:
+    raw = decode_html_text(str(locale or "")).strip()
+    if raw in {"en", "zh-Hant", "zh-Hans", "ja", "ko"}:
+        return raw
+    low = raw.casefold()
+    if low in {"zh-hant", "zh_tw", "zh-tw"}:
+        return "zh-Hant"
+    if low in {"zh-hans", "zh_cn", "zh-cn"}:
+        return "zh-Hans"
+    if low in {"ja", "ja-jp"}:
+        return "ja"
+    if low in {"ko", "ko-kr"}:
+        return "ko"
+    return "en"
+
+
+def reply_locale_from_language_hint(language_hint: str, default: str = "en") -> str:
+    low = decode_html_text(str(language_hint or "")).casefold().strip()
+    if not low:
+        return canonical_reply_locale(default)
+    if any(
+        token in low
+        for token in [
+            "cantonese",
+            "chinese-traditional",
+            "traditional",
+            "zh-hant",
+            "zh_tw",
+            "zh-tw",
+            "繁體",
+            "繁体",
+        ]
+    ):
+        return "zh-Hant"
+    if any(
+        token in low
+        for token in [
+            "chinese-simplified",
+            "simplified",
+            "zh-hans",
+            "zh_cn",
+            "zh-cn",
+            "简体",
+        ]
+    ):
+        return "zh-Hans"
+    if "chinese" in low or low == "zh":
+        return "zh-Hant"
+    if "japanese" in low or low.startswith("ja"):
+        return "ja"
+    if "korean" in low or "hangul" in low or low.startswith("ko"):
+        return "ko"
+    return canonical_reply_locale(default)
+
+
+def localize_reply_line_labels(locale: str) -> Dict[str, str]:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return {
+            "summary": "摘要",
+            "doc_status": "Google 文件狀態",
+            "doc_url": "Google 文件連結",
+            "error": "錯誤",
+        }
+    if loc == "zh-Hans":
+        return {
+            "summary": "摘要",
+            "doc_status": "Google 文档状态",
+            "doc_url": "Google 文档链接",
+            "error": "错误",
+        }
+    if loc == "ja":
+        return {
+            "summary": "要約",
+            "doc_status": "Google ドキュメント状態",
+            "doc_url": "Google ドキュメントURL",
+            "error": "エラー",
+        }
+    if loc == "ko":
+        return {
+            "summary": "요약",
+            "doc_status": "Google 문서 상태",
+            "doc_url": "Google 문서 URL",
+            "error": "오류",
+        }
+    return {
+        "summary": "Summary",
+        "doc_status": "Google Doc status",
+        "doc_url": "Google Doc URL",
+        "error": "Error",
+    }
+
+
+def localized_duplicate_summary(title: str, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return f"此 URL 的食譜已存在，沿用既有 Google 文件：{title}。"
+    if loc == "zh-Hans":
+        return f"该 URL 的食谱已存在，沿用已有 Google 文档：{title}。"
+    if loc == "ja":
+        return f"この URL のレシピは既に存在します。既存の Google ドキュメントを再利用します: {title}。"
+    if loc == "ko":
+        return f"이 URL의 레시피가 이미 존재합니다. 기존 Google 문서를 재사용합니다: {title}."
+    return f"Recipe already exists for this URL. Reusing existing Google Doc: {title}."
+
+
+def localized_source_crawl_failed_prefix(locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return "來源擷取失敗；已使用備援內容。"
+    if loc == "zh-Hans":
+        return "来源抓取失败；已使用回退内容。"
+    if loc == "ja":
+        return "ソース取得に失敗したため、フォールバック内容を生成しました。"
+    if loc == "ko":
+        return "원본 수집에 실패하여 대체 내용을 생성했습니다."
+    return "Source crawl failed; generated fallback content."
+
+
+def localized_validation_error_missing(missing_label: str, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return f"食譜文字缺少必要欄位：{missing_label}"
+    if loc == "zh-Hans":
+        return f"食谱文字缺少必填字段：{missing_label}"
+    if loc == "ja":
+        return f"レシピ本文に必須項目が不足しています: {missing_label}"
+    if loc == "ko":
+        return f"레시피 텍스트에 필수 항목이 부족합니다: {missing_label}"
+    return f"text recipe missing required fields: {missing_label}"
+
+
+def localized_validation_failed_summary(missing_label: str, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return f"食譜文字驗證失敗，缺少：{missing_label}。"
+    if loc == "zh-Hans":
+        return f"食谱文本校验失败，缺少：{missing_label}。"
+    if loc == "ja":
+        return f"レシピ本文の検証に失敗しました。不足: {missing_label}。"
+    if loc == "ko":
+        return f"레시피 텍스트 검증 실패. 누락 항목: {missing_label}."
+    return f"Recipe text validation failed. Missing: {missing_label}."
+
+
+def localized_stale_doc_removed_message(count: int, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        return f"已移除 {count} 個失效的 Google 文件連結"
+    if loc == "zh-Hans":
+        return f"已移除 {count} 个失效的 Google 文档链接"
+    if loc == "ja":
+        return f"無効な Google ドキュメントリンクを {count} 件削除しました"
+    if loc == "ko":
+        return f"만료된 Google 문서 링크 {count}개를 제거했습니다"
+    return f"removed {count} stale Google Doc link(s)"
+
+
+def localized_enquiry_summary(query_text: str, count: int, top_title: str, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    query = normalize_space(query_text)[:60]
+    title = normalize_space(top_title)
+    if count > 0:
+        if loc == "zh-Hant":
+            out = f"已找到 {count} 筆與「{query}」相符的已儲存食譜。"
+            if title:
+                out += f" 最佳符合：{title}。"
+            return out
+        if loc == "zh-Hans":
+            out = f"已找到 {count} 条与“{query}”匹配的已保存食谱。"
+            if title:
+                out += f" 最佳匹配：{title}。"
+            return out
+        if loc == "ja":
+            out = f"「{query}」に一致する保存済みレシピが {count} 件見つかりました。"
+            if title:
+                out += f" 最上位: {title}。"
+            return out
+        if loc == "ko":
+            out = f"'{query}'와 일치하는 저장된 레시피 {count}개를 찾았습니다."
+            if title:
+                out += f" 최상위 결과: {title}."
+            return out
+        out = f"Found {count} matching saved recipes for '{query}'."
+        if title:
+            out += f" Top match: {title}."
+        return out
+    if loc == "zh-Hant":
+        return f"在記憶/歷史與 Google 文件中找不到與「{query}」相符的已儲存食譜。"
+    if loc == "zh-Hans":
+        return f"在记忆/历史与 Google 文档中未找到与“{query}”匹配的已保存食谱。"
+    if loc == "ja":
+        return f"メモリ/履歴または Google ドキュメント内で「{query}」に一致する保存済みレシピが見つかりませんでした。"
+    if loc == "ko":
+        return f"메모리/기록 또는 Google 문서에서 '{query}'와 일치하는 저장된 레시피를 찾지 못했습니다."
+    return f"No saved recipe matched '{query}' in memory/history or Google Docs."
+
+
+def short_chat_summary(source: Dict[str, Any], formats: Dict[str, str], source_error: str, locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
     url = str(source.get("url", ""))
     domain = urlparse(url).netloc.lower()
     title = normalize_title_for_chat(str(source.get("title", ""))) or "Untitled recipe"
@@ -1236,37 +1435,143 @@ def short_chat_summary(source: Dict[str, Any], formats: Dict[str, str], source_e
     input_language = decode_html_text(str(source.get("input_language", ""))).strip()
 
     if is_text_recipe and missing_fields:
-        missing_label = summarize_text_recipe_validation([str(x) for x in missing_fields])
-        lang_part = f" ({input_language})" if input_language else ""
-        summary = f"Recipe text received{lang_part}, but missing {missing_label}."
+        missing_label = summarize_text_recipe_validation([str(x) for x in missing_fields], locale=loc)
+        if loc == "zh-Hant":
+            lang_part = f"（{input_language}）" if input_language else ""
+            summary = f"已收到食譜文字{lang_part}，但缺少：{missing_label}。"
+        elif loc == "zh-Hans":
+            lang_part = f"（{input_language}）" if input_language else ""
+            summary = f"已收到食谱文本{lang_part}，但缺少：{missing_label}。"
+        elif loc == "ja":
+            lang_part = f"（{input_language}）" if input_language else ""
+            summary = f"レシピ本文を受信{lang_part}しましたが、不足があります: {missing_label}。"
+        elif loc == "ko":
+            lang_part = f" ({input_language})" if input_language else ""
+            summary = f"레시피 텍스트를 수신{lang_part}했지만 누락 항목이 있습니다: {missing_label}."
+        else:
+            lang_part = f" ({input_language})" if input_language else ""
+            summary = f"Recipe text received{lang_part}, but missing {missing_label}."
     elif is_text_recipe:
-        lang_part = f" ({input_language})" if input_language else ""
-        if top_ingredients:
-            summary = f"Recipe text processed{lang_part}: {title}. Key ingredients: {top_ingredients}."
+        if loc == "zh-Hant":
+            lang_part = f"（{input_language}）" if input_language else ""
+            if top_ingredients:
+                summary = f"食譜文字已處理{lang_part}：{title}。主要材料：{top_ingredients}。"
+            else:
+                summary = f"食譜文字已處理{lang_part}：{title}。"
+        elif loc == "zh-Hans":
+            lang_part = f"（{input_language}）" if input_language else ""
+            if top_ingredients:
+                summary = f"食谱文本已处理{lang_part}：{title}。主要食材：{top_ingredients}。"
+            else:
+                summary = f"食谱文本已处理{lang_part}：{title}。"
+        elif loc == "ja":
+            lang_part = f"（{input_language}）" if input_language else ""
+            if top_ingredients:
+                summary = f"レシピ本文を処理しました{lang_part}: {title}。主な材料: {top_ingredients}。"
+            else:
+                summary = f"レシピ本文を処理しました{lang_part}: {title}。"
+        elif loc == "ko":
+            lang_part = f" ({input_language})" if input_language else ""
+            if top_ingredients:
+                summary = f"레시피 텍스트 처리 완료{lang_part}: {title}. 주요 재료: {top_ingredients}."
+            else:
+                summary = f"레시피 텍스트 처리 완료{lang_part}: {title}."
         else:
-            summary = f"Recipe text processed{lang_part}: {title}."
+            lang_part = f" ({input_language})" if input_language else ""
+            if top_ingredients:
+                summary = f"Recipe text processed{lang_part}: {title}. Key ingredients: {top_ingredients}."
+            else:
+                summary = f"Recipe text processed{lang_part}: {title}."
     elif "instagram.com" in domain:
-        if top_ingredients:
-            summary = f"Instagram reel recipe: {title}. Key ingredients: {top_ingredients}."
+        if loc == "zh-Hant":
+            summary = f"已擷取 Instagram 食譜：{title}。"
+            if top_ingredients:
+                summary += f" 主要材料：{top_ingredients}。"
+        elif loc == "zh-Hans":
+            summary = f"已抓取 Instagram 食谱：{title}。"
+            if top_ingredients:
+                summary += f" 主要食材：{top_ingredients}。"
+        elif loc == "ja":
+            summary = f"Instagram のレシピを取得しました: {title}。"
+            if top_ingredients:
+                summary += f" 主な材料: {top_ingredients}。"
+        elif loc == "ko":
+            summary = f"Instagram 레시피를 수집했습니다: {title}."
+            if top_ingredients:
+                summary += f" 주요 재료: {top_ingredients}."
         else:
-            summary = f"Instagram reel recipe captured: {title}."
+            if top_ingredients:
+                summary = f"Instagram reel recipe: {title}. Key ingredients: {top_ingredients}."
+            else:
+                summary = f"Instagram reel recipe captured: {title}."
     elif "threads.com" in domain:
-        if top_ingredients:
-            summary = f"Threads post recipe: {title}. Key ingredients: {top_ingredients}."
+        if loc == "zh-Hant":
+            summary = f"已擷取 Threads 食譜：{title}。"
+            if top_ingredients:
+                summary += f" 主要材料：{top_ingredients}。"
+        elif loc == "zh-Hans":
+            summary = f"已抓取 Threads 食谱：{title}。"
+            if top_ingredients:
+                summary += f" 主要食材：{top_ingredients}。"
+        elif loc == "ja":
+            summary = f"Threads のレシピ投稿を取得しました: {title}。"
+            if top_ingredients:
+                summary += f" 主な材料: {top_ingredients}。"
+        elif loc == "ko":
+            summary = f"Threads 레시피 게시물을 수집했습니다: {title}."
+            if top_ingredients:
+                summary += f" 주요 재료: {top_ingredients}."
         else:
-            summary = f"Threads post recipe captured: {title}."
+            if top_ingredients:
+                summary = f"Threads post recipe: {title}. Key ingredients: {top_ingredients}."
+            else:
+                summary = f"Threads post recipe captured: {title}."
     elif is_video:
-        if top_ingredients:
-            summary = f"Video recipe captured: {title}. Key ingredients: {top_ingredients}."
+        if loc == "zh-Hant":
+            summary = f"已擷取影片食譜：{title}。"
+            if top_ingredients:
+                summary += f" 主要材料：{top_ingredients}。"
+        elif loc == "zh-Hans":
+            summary = f"已抓取视频食谱：{title}。"
+            if top_ingredients:
+                summary += f" 主要食材：{top_ingredients}。"
+        elif loc == "ja":
+            summary = f"動画レシピを取得しました: {title}。"
+            if top_ingredients:
+                summary += f" 主な材料: {top_ingredients}。"
+        elif loc == "ko":
+            summary = f"동영상 레시피를 수집했습니다: {title}."
+            if top_ingredients:
+                summary += f" 주요 재료: {top_ingredients}."
         else:
-            summary = f"Video recipe captured: {title}."
+            if top_ingredients:
+                summary = f"Video recipe captured: {title}. Key ingredients: {top_ingredients}."
+            else:
+                summary = f"Video recipe captured: {title}."
     else:
-        summary = ai_summary or f"Recipe captured: {title}."
-        if len(summary) < 40 and top_ingredients:
-            summary = f"{summary} Key ingredients: {top_ingredients}."
+        if loc == "en":
+            summary = ai_summary or f"Recipe captured: {title}."
+            if len(summary) < 40 and top_ingredients:
+                summary = f"{summary} Key ingredients: {top_ingredients}."
+        elif loc == "zh-Hant":
+            summary = f"已擷取食譜：{title}。"
+            if top_ingredients:
+                summary += f" 主要材料：{top_ingredients}。"
+        elif loc == "zh-Hans":
+            summary = f"已抓取食谱：{title}。"
+            if top_ingredients:
+                summary += f" 主要食材：{top_ingredients}。"
+        elif loc == "ja":
+            summary = f"レシピを取得しました: {title}。"
+            if top_ingredients:
+                summary += f" 主な材料: {top_ingredients}。"
+        else:
+            summary = f"레시피를 수집했습니다: {title}."
+            if top_ingredients:
+                summary += f" 주요 재료: {top_ingredients}."
 
     if source_error:
-        summary = f"Source crawl failed; generated fallback content. {summary}"
+        summary = f"{localized_source_crawl_failed_prefix(loc)} {summary}"
     summary = normalize_space(summary)
     if len(summary) > 220:
         summary = summary[:217].rstrip() + "..."
@@ -1279,10 +1584,21 @@ def decorate_summary_with_attempt_status(
     host_hint: str,
     has_processing_error: bool,
     auto_review_triggers: List[str],
+    locale: str = "en",
 ) -> str:
+    loc = canonical_reply_locale(locale)
     out = normalize_space(summary)
     if not out:
-        out = "Processing completed."
+        if loc == "zh-Hant":
+            out = "處理完成。"
+        elif loc == "zh-Hans":
+            out = "处理完成。"
+        elif loc == "ja":
+            out = "処理が完了しました。"
+        elif loc == "ko":
+            out = "처리가 완료되었습니다."
+        else:
+            out = "Processing completed."
 
     host = host_hint.strip().lower()
     if not host and initial_url:
@@ -1292,13 +1608,43 @@ def decorate_summary_with_attempt_status(
             host = ""
 
     if initial_url and has_processing_error:
-        attempt_text = f"Tried processing URL source ({host}) first." if host else "Tried processing this URL first."
-        if "tried processing" not in out.casefold():
+        if loc == "zh-Hant":
+            attempt_text = f"已先嘗試處理 URL 來源（{host}）。" if host else "已先嘗試處理此 URL。"
+            attempt_marker = "已先嘗試處理"
+        elif loc == "zh-Hans":
+            attempt_text = f"已先尝试处理 URL 来源（{host}）。" if host else "已先尝试处理此 URL。"
+            attempt_marker = "已先尝试处理"
+        elif loc == "ja":
+            attempt_text = f"まず URL ソース（{host}）の処理を試行しました。" if host else "まずこの URL の処理を試行しました。"
+            attempt_marker = "処理を試行"
+        elif loc == "ko":
+            attempt_text = f"먼저 URL 소스({host}) 처리를 시도했습니다." if host else "먼저 이 URL 처리를 시도했습니다."
+            attempt_marker = "처리를 시도"
+        else:
+            attempt_text = f"Tried processing URL source ({host}) first." if host else "Tried processing this URL first."
+            attempt_marker = "tried processing"
+        if attempt_marker.casefold() not in out.casefold():
             out = f"{attempt_text} {out}".strip()
 
     auto_review_hit = any(str(x).strip().endswith(":triggered") for x in auto_review_triggers)
-    if has_processing_error and auto_review_hit and "self-improve" not in out.casefold():
-        out = f"{out} Self-improve review triggered."
+    if has_processing_error and auto_review_hit:
+        if loc == "zh-Hant":
+            self_improve_text = "已觸發自我改進檢查。"
+            marker = "自我改進"
+        elif loc == "zh-Hans":
+            self_improve_text = "已触发自我改进检查。"
+            marker = "自我改进"
+        elif loc == "ja":
+            self_improve_text = "自己改善レビューをトリガーしました。"
+            marker = "自己改善"
+        elif loc == "ko":
+            self_improve_text = "자가 개선 검토를 트리거했습니다."
+            marker = "자가 개선"
+        else:
+            self_improve_text = "Self-improve review triggered."
+            marker = "self-improve"
+        if marker.casefold() not in out.casefold():
+            out = f"{out} {self_improve_text}"
 
     out = normalize_space(out)
     if len(out) > 220:
@@ -1343,14 +1689,21 @@ def human_readable_doc_summary(source: Dict[str, Any], formats: Dict[str, str]) 
     return preferred
 
 
-def build_reply_message(summary: str, google_doc_status: str, google_doc_url: str, error_message: str) -> str:
+def build_reply_message(
+    summary: str,
+    google_doc_status: str,
+    google_doc_url: str,
+    error_message: str,
+    locale: str = "en",
+) -> str:
+    labels = localize_reply_line_labels(locale)
     lines: List[str] = []
-    lines.append(f"Summary: {normalize_space(summary)}")
-    lines.append(f"Google Doc status: {normalize_space(google_doc_status)}")
-    lines.append(f"Google Doc URL: {normalize_space(google_doc_url)}")
+    lines.append(f"{labels['summary']}: {normalize_space(summary)}")
+    lines.append(f"{labels['doc_status']}: {normalize_space(google_doc_status)}")
+    lines.append(f"{labels['doc_url']}: {normalize_space(google_doc_url)}")
     clean_error = normalize_space(error_message)
     if clean_error:
-        lines.append(f"Error: {clean_error}")
+        lines.append(f"{labels['error']}: {clean_error}")
     return "\n".join(lines)
 
 
@@ -2538,7 +2891,8 @@ def google_drive_search_docs(query_text: str, limit: int = 8) -> Tuple[List[Dict
     return out[:limit], ""
 
 
-def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
+def run_recipe_enquiry(query_text: str, output_dir: Path, locale: str = "en") -> Dict[str, Any]:
+    reply_locale = canonical_reply_locale(locale)
     notes_root = output_dir
     memory_root = Path(read_env_value("CHIEF_FAFA_MEMORY_ROOT", "/home/felixlee/Desktop/chief-fafa"))
     memory_dir = memory_root / "memory"
@@ -2616,12 +2970,12 @@ def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
             break
 
     top_titles = [str(x.get("title", "")).strip() for x in deduped[:3] if str(x.get("title", "")).strip()]
-    if deduped:
-        summary = f"Found {len(deduped)} matching saved recipes for '{normalize_space(query_text)[:60]}'."
-        if top_titles:
-            summary += f" Top match: {top_titles[0]}."
-    else:
-        summary = f"No saved recipe matched '{normalize_space(query_text)[:60]}' in memory/history or Google Docs."
+    summary = localized_enquiry_summary(
+        query_text=query_text,
+        count=len(deduped),
+        top_title=top_titles[0] if top_titles else "",
+        locale=reply_locale,
+    )
 
     err_parts: List[str] = []
     if token_err:
@@ -2629,7 +2983,7 @@ def run_recipe_enquiry(query_text: str, output_dir: Path) -> Dict[str, Any]:
     if docs_err:
         err_parts.append(docs_err)
     if stale_doc_count:
-        err_parts.append(f"removed {stale_doc_count} stale Google Doc link(s)")
+        err_parts.append(localized_stale_doc_removed_message(stale_doc_count, locale=reply_locale))
     error_message = " | ".join(err_parts).strip()
     doc_status = "found" if bool(top_doc_url) else "not_found"
     if doc_status == "not_found" and docs_err and not deduped:
@@ -2677,8 +3031,53 @@ def infer_text_language_label(text: str) -> str:
         ]
         if any(h in clean for h in cantonese_hints):
             return "cantonese"
-        traditional_hints = ["體", "麼", "這", "還", "與", "為", "會", "裡", "讓", "點"]
-        simplified_hints = ["体", "么", "这", "还", "与", "为", "会", "里", "让", "点"]
+        # Include cooking/common Han variants so short recipe queries can still infer zh-Hans vs zh-Hant.
+        traditional_hints = [
+            "體",
+            "麼",
+            "這",
+            "還",
+            "與",
+            "為",
+            "會",
+            "裡",
+            "讓",
+            "點",
+            "後",
+            "國",
+            "發",
+            "麵",
+            "參",
+            "譜",
+            "龍",
+            "雞",
+            "魚",
+            "湯",
+            "飯",
+        ]
+        simplified_hints = [
+            "体",
+            "么",
+            "这",
+            "还",
+            "与",
+            "为",
+            "会",
+            "里",
+            "让",
+            "点",
+            "后",
+            "国",
+            "发",
+            "面",
+            "参",
+            "谱",
+            "龙",
+            "鸡",
+            "鱼",
+            "汤",
+            "饭",
+        ]
         trad_score = sum(clean.count(x) for x in traditional_hints)
         simp_score = sum(clean.count(x) for x in simplified_hints)
         if trad_score > simp_score:
@@ -2704,6 +3103,18 @@ def infer_text_language_label(text: str) -> str:
     if p["latin"] >= 6:
         return "latin-script"
     return "unknown"
+
+
+def detect_reply_locale_from_input(raw_text: str, default: str = "en") -> str:
+    clean = decode_html_text(unescape(str(raw_text or "")))
+    if not clean:
+        return canonical_reply_locale(default)
+    without_urls = URL_PATTERN.sub(" ", clean)
+    probe = normalize_space(without_urls) or normalize_space(clean)
+    if not probe:
+        return canonical_reply_locale(default)
+    detected_label = infer_text_language_label(probe)
+    return reply_locale_from_language_hint(detected_label, default=default)
 
 
 def extract_text_recipe_title(text: str) -> str:
@@ -2741,12 +3152,38 @@ def extract_text_recipe_title(text: str) -> str:
     return ""
 
 
-def summarize_text_recipe_validation(missing: List[str]) -> str:
-    label_map = {
-        "recipe_name": "recipe name",
-        "ingredients": "ingredients",
-        "method_steps": "method/steps",
-    }
+def summarize_text_recipe_validation(missing: List[str], locale: str = "en") -> str:
+    loc = canonical_reply_locale(locale)
+    if loc == "zh-Hant":
+        label_map = {
+            "recipe_name": "食譜名稱",
+            "ingredients": "材料",
+            "method_steps": "做法/步驟",
+        }
+    elif loc == "zh-Hans":
+        label_map = {
+            "recipe_name": "食谱名称",
+            "ingredients": "食材",
+            "method_steps": "做法/步骤",
+        }
+    elif loc == "ja":
+        label_map = {
+            "recipe_name": "レシピ名",
+            "ingredients": "材料",
+            "method_steps": "手順",
+        }
+    elif loc == "ko":
+        label_map = {
+            "recipe_name": "레시피 이름",
+            "ingredients": "재료",
+            "method_steps": "조리 단계",
+        }
+    else:
+        label_map = {
+            "recipe_name": "recipe name",
+            "ingredients": "ingredients",
+            "method_steps": "method/steps",
+        }
     labels = [label_map.get(x, x) for x in missing]
     return ", ".join(labels)
 
@@ -4908,6 +5345,7 @@ def main() -> None:
     ):
         inbound_image_sources = collect_recent_inbound_images(max_age_seconds=45 * 60, max_items=6)
     raw_source = strip_transport_wrapper_text(raw_source)
+    reply_locale = detect_reply_locale_from_input(raw_source, default="en")
 
     output_dir = Path(args.output_dir)
     try:
@@ -4964,7 +5402,7 @@ def main() -> None:
             auto_review_triggers.append(f"new_url_host:{host}:{trigger_state}")
 
     if raw_source and looks_like_recipe_enquiry(raw_source):
-        lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
+        lookup = run_recipe_enquiry(raw_source, output_dir=output_dir, locale=reply_locale)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
         slug = slugify(f"enquiry-{lookup.get('query', '')}")
         report_path = output_dir / f"{stamp}-{slug}.md"
@@ -4995,6 +5433,7 @@ def main() -> None:
                         google_doc_status=google_doc_status,
                         google_doc_url=google_doc_url,
                         error_message=error_message,
+                        locale=reply_locale,
                     ),
                     "lookup": lookup,
                     "auto_review_triggers": auto_review_triggers,
@@ -5033,9 +5472,9 @@ def main() -> None:
             report_markdown = format_duplicate_markdown_report(initial_dup)
             report_path.write_text(report_markdown, encoding="utf-8")
 
-            duplicate_summary = (
-                f"Recipe already exists for this URL. Reusing existing Google Doc: "
-                f"{decode_html_text(str(initial_dup.get('title', 'Recipe')))}."
+            duplicate_summary = localized_duplicate_summary(
+                title=decode_html_text(str(initial_dup.get("title", "Recipe"))),
+                locale=reply_locale,
             )
             brief = {
                 "ok": True,
@@ -5048,6 +5487,7 @@ def main() -> None:
                     google_doc_status="exists",
                     google_doc_url=str(initial_dup.get("doc_url", "")).strip(),
                     error_message="",
+                    locale=reply_locale,
                 ),
                 "doc": {
                     "ok": True,
@@ -5105,6 +5545,10 @@ def main() -> None:
             source_error = f"{exc.__class__.__name__}: {exc}"
             source["source_error"] = source_error
 
+    source_language_hint = decode_html_text(str(source.get("input_language", ""))).strip()
+    if source_language_hint:
+        reply_locale = reply_locale_from_language_hint(source_language_hint, default=reply_locale)
+
     source_base_image_urls = source.get("image_urls", [])
     if not isinstance(source_base_image_urls, list):
         source_base_image_urls = []
@@ -5120,9 +5564,10 @@ def main() -> None:
         validation_missing = []
     validation_error = ""
     if str(source.get("content_type", "")).strip().lower() == "text_recipe_input" and validation_missing:
-        validation_error = f"text recipe missing required fields: {summarize_text_recipe_validation([str(x) for x in validation_missing])}"
+        missing_label = summarize_text_recipe_validation([str(x) for x in validation_missing], locale=reply_locale)
+        validation_error = localized_validation_error_missing(missing_label, locale=reply_locale)
         if should_try_enquiry_fallback(raw_source, [str(x) for x in validation_missing]):
-            lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
+            lookup = run_recipe_enquiry(raw_source, output_dir=output_dir, locale=reply_locale)
             lookup_results = lookup.get("results", [])
             lookup_has_match = bool(lookup_results) or (
                 str(lookup.get("google_doc_status", "")).strip().lower() in {"found", "exists"}
@@ -5150,6 +5595,7 @@ def main() -> None:
                                 google_doc_status=google_doc_status,
                                 google_doc_url=google_doc_url,
                                 error_message=error_message,
+                                locale=reply_locale,
                             ),
                             "lookup": lookup,
                             "auto_review_triggers": auto_review_triggers,
@@ -5178,15 +5624,14 @@ def main() -> None:
     ai_err = ""
     if validation_error:
         formats = build_formats_fallback(source)
-        formats["summary"] = (
-            f"Recipe text validation failed. Missing: {summarize_text_recipe_validation([str(x) for x in validation_missing])}."
-        )
+        missing_label = summarize_text_recipe_validation([str(x) for x in validation_missing], locale=reply_locale)
+        formats["summary"] = localized_validation_failed_summary(missing_label, locale=reply_locale)
     else:
         formats, ai_err = build_formats_with_openai(source)
         if not formats:
             formats = build_formats_fallback(source)
     if source_error:
-        summary_prefix = "Source crawl failed; generated fallback content only."
+        summary_prefix = localized_source_crawl_failed_prefix(reply_locale)
         formats["summary"] = f"{summary_prefix} {formats.get('summary', '')}".strip()
     video_note = decode_html_text(str(source.get("video_note", ""))).strip()
     text_parse_note = decode_html_text(str(source.get("input_parse_note", ""))).strip()
@@ -5260,12 +5705,12 @@ def main() -> None:
     if args.json:
         if args.json_brief:
             if duplicate_hit_post_fetch:
-                summary = (
-                    f"Recipe already exists for this URL. Reusing existing Google Doc: "
-                    f"{decode_html_text(str(duplicate_hit_post_fetch.get('title', source.get('title', 'Recipe'))))}."
+                summary = localized_duplicate_summary(
+                    title=decode_html_text(str(duplicate_hit_post_fetch.get("title", source.get("title", "Recipe")))),
+                    locale=reply_locale,
                 )
             else:
-                summary = short_chat_summary(source, formats, source_error)
+                summary = short_chat_summary(source, formats, source_error, locale=reply_locale)
             doc_status = "ok" if bool(note_result.get("ok")) else "failed"
             if duplicate_hit_post_fetch:
                 doc_status = "exists"
@@ -5346,6 +5791,7 @@ def main() -> None:
                 host_hint=host_hint,
                 has_processing_error=has_processing_error,
                 auto_review_triggers=auto_review_triggers,
+                locale=reply_locale,
             )
 
             brief = {
@@ -5359,6 +5805,7 @@ def main() -> None:
                     google_doc_status=doc_status,
                     google_doc_url=doc_url,
                     error_message=error_message,
+                    locale=reply_locale,
                 ),
                 "doc": note_result,
                 "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
