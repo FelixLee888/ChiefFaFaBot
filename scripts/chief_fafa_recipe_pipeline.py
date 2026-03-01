@@ -12,6 +12,7 @@ It always prints a report, even when one or more integrations fail.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import io
 import json
@@ -26,7 +27,7 @@ import time
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
 import requests
 
@@ -52,13 +53,21 @@ VIDEO_TEXT_MAX_CHARS = 24000
 TRANSCRIPT_MODEL = "gpt-4o-mini-transcribe"
 DOC_IMAGE_MARKER = "[[CHIEF_FAFA_IMAGE_HERE]]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", flags=re.IGNORECASE)
+DATA_IMAGE_RE = re.compile(r"^data:(image/[a-z0-9.+-]+);base64,(.+)$", flags=re.IGNORECASE | re.DOTALL)
+IMAGE_EXT_RE = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif)(?:[?#].*)?$", flags=re.IGNORECASE)
+OPENCLAW_INBOUND_MEDIA_PREFIX = "/home/felixlee/.openclaw/media/inbound/"
+LOCAL_IMAGE_ALLOWED_PREFIXES = [
+    OPENCLAW_INBOUND_MEDIA_PREFIX,
+    f"{str(Path(tempfile.gettempdir()).resolve())}/",
+]
 INLINE_INGREDIENT_STOP_PATTERN = re.compile(
     r"(?:\b(?:instructions?|method|steps?|directions?)\b|做法|作法|手順|作り方|https?://|#\w)",
     flags=re.IGNORECASE,
 )
 INLINE_INGREDIENT_PATTERN = re.compile(
-    r"([A-Za-z\u00C0-\u024F\u3400-\u9fff][A-Za-z0-9\u00C0-\u024F\u3400-\u9fff'’()\/,&.+\- ]{0,72}?)\s*"
-    r"(\d+(?:\.\d+)?)\s*"
+    r"([A-Za-z\u00C0-\u024F\u3400-\u9fff][A-Za-z0-9\u00C0-\u024F\u3400-\u9fff'’()\/,&.+\- ]{0,72}?)"
+    r"(?:\s*[-–—:：~]\s*|\s+)"
+    r"(\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)\s*"
     r"(kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cups?|pcs?|pc|克|公斤|毫升|公升|茶匙|湯匙|汤匙|大匙|小匙|"
     r"條|条|隻|只|個|个|片|塊|块|顆|颗|粒)",
     flags=re.IGNORECASE,
@@ -134,6 +143,54 @@ ENQUIRY_STOPWORDS = {
     "show",
     "look",
     "up",
+}
+
+# Query-term alias expansion improves multilingual recall for saved-recipe lookup.
+# Keep keys and values case-folded for deterministic matching.
+ENQUIRY_TERM_ALIASES: Dict[str, List[str]] = {
+    "sea cucumber": [
+        "sea-cucumber",
+        "trepang",
+        "beche de mer",
+        "beche-de-mer",
+        "海參",
+        "海参",
+        "遼參",
+        "辽参",
+    ],
+    "sea-cucumber": [
+        "sea cucumber",
+        "trepang",
+        "海參",
+        "海参",
+    ],
+    "trepang": [
+        "sea cucumber",
+        "海參",
+        "海参",
+    ],
+    "海參": [
+        "海参",
+        "sea cucumber",
+        "trepang",
+    ],
+    "海参": [
+        "海參",
+        "sea cucumber",
+        "trepang",
+    ],
+    "遼參": [
+        "辽参",
+        "海參",
+        "海参",
+        "sea cucumber",
+    ],
+    "辽参": [
+        "遼參",
+        "海參",
+        "海参",
+        "sea cucumber",
+    ],
 }
 
 INGREDIENT_HEADING_KEYWORDS = [
@@ -436,6 +493,35 @@ def extract_inline_ingredient_items(text: str, max_items: int = 120) -> List[str
     return out
 
 
+def looks_like_bare_ingredient_line(text: str) -> bool:
+    line = normalize_space(unescape(text or ""))
+    if not line:
+        return False
+    low = line.casefold()
+    if re.search(r"https?://", low):
+        return False
+    if line.startswith("#"):
+        return False
+    if is_comment_or_social_line(line):
+        return False
+    if len(line) < 2 or len(line) > 80:
+        return False
+    if re.match(r"^\d", line):
+        return False
+    if re.search(r"[。.!?;；]", line):
+        return False
+    if re.search(
+        r"\b(?:mix|stir|whisk|bake|cook|fry|boil|simmer|heat|preheat|add|pour|serve|combine|sponsor|thanks|follow|support|subscribe|page)\b",
+        low,
+    ):
+        return False
+    if re.search(r"(?:加入|攪拌|搅拌|烘烤|煮|炒|炸|加熱|加热|烤|煎|焗|拌|倒入|烹|蒸|焼く|混ぜ|加える|煮る|炒め|感謝|赞助|贊助)", line):
+        return False
+    if not re.search(r"[A-Za-z\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", line):
+        return False
+    return True
+
+
 def extract_inline_ingredient_segment(text_blob: str) -> str:
     raw = unescape(text_blob or "")
     ing_kw = heading_keywords_pattern(INGREDIENT_HEADING_KEYWORDS)
@@ -701,6 +787,28 @@ def extract_recipe_sections_from_text_blob(text_blob: str) -> Tuple[List[str], L
         inline_items = extract_inline_ingredient_items(inline_tail, max_items=260)
         if inline_items:
             ingredients = unique_clean_lines(inline_items, max_items=260)
+    if not ingredients and lines:
+        measured_items: List[str] = []
+        measured_line_indexes: List[int] = []
+        for idx, line in enumerate(lines):
+            items = extract_inline_ingredient_items(line, max_items=12)
+            if not items:
+                continue
+            measured_items.extend(items)
+            measured_line_indexes.append(idx)
+        if measured_items:
+            trailing_extras: List[str] = []
+            scan_start = measured_line_indexes[-1] + 1
+            scan_end = min(len(lines), scan_start + 8)
+            for j in range(scan_start, scan_end):
+                cur = lines[j]
+                if is_heading_start_line(cur, METHOD_HEADING_KEYWORDS) or is_heading_start_line(cur, STOP_SECTION_KEYWORDS):
+                    break
+                if re.search(r"https?://", cur, flags=re.IGNORECASE):
+                    break
+                if looks_like_bare_ingredient_line(cur):
+                    trailing_extras.append(cur)
+            ingredients = unique_clean_lines(measured_items + trailing_extras, max_items=260)
 
     if not steps and lines:
         synthetic_steps = [
@@ -758,6 +866,9 @@ def extract_video_text_sources(final_url: str, initial_description: str) -> Dict
     meta_description = normalize_multiline_text(str(meta.get("description", "")))
     if has_meaningful_text(meta_description, min_chars=20):
         out["description"] = meta_description
+    chapter_steps = extract_ytdlp_chapter_steps(meta, max_items=80)
+    if chapter_steps:
+        out["chapters"] = "\n".join(chapter_steps)
 
     preferred_lang = str(meta.get("language", "")).strip()
     subtitle_url = select_caption_track_url(meta.get("subtitles"), preferred_lang=preferred_lang)
@@ -1261,7 +1372,187 @@ def extract_first_url(text: str) -> str:
     return url
 
 
-def extract_enquiry_terms(text: str, max_terms: int = 8) -> List[str]:
+def normalize_image_source_ref(value: str) -> str:
+    raw = unescape(str(value or "")).strip().strip("'\"")
+    if not raw:
+        return ""
+    if raw.casefold().startswith("media:"):
+        raw = raw.split(":", 1)[1].strip().strip("'\"")
+    if raw.casefold().startswith("file://"):
+        parsed = urlparse(raw)
+        path = unquote(parsed.path or "")
+        return path.strip()
+    return raw
+
+
+def looks_like_image_source_ref(value: str) -> bool:
+    ref = normalize_image_source_ref(value)
+    if not ref:
+        return False
+    low = ref.casefold()
+    if low.startswith("data:image/"):
+        return True
+    if low.startswith("http://") or low.startswith("https://"):
+        parsed = urlparse(ref)
+        path = parsed.path or ""
+        if IMAGE_EXT_RE.search(path):
+            return True
+        # Some CDN image URLs do not have extensions in path.
+        if any(host_hint in parsed.netloc.casefold() for host_hint in ["cdninstagram.com", "googleusercontent.com", "ytimg.com"]):
+            return True
+        return False
+    if os.path.isabs(ref):
+        return bool(IMAGE_EXT_RE.search(ref))
+    return False
+
+
+def collect_media_image_sources(raw_text: str, max_items: int = 12) -> List[str]:
+    text = str(raw_text or "")
+    if not text:
+        return []
+
+    candidates: List[str] = []
+
+    for block in re.findall(r"\[media attached:\s*(.*?)\]", text, flags=re.IGNORECASE | re.DOTALL):
+        for part in re.split(r"\s*\|\s*", block):
+            token = re.sub(r"\s+\(image/[a-z0-9.+-]+\)\s*$", "", str(part or "").strip(), flags=re.IGNORECASE)
+            if token:
+                candidates.append(token)
+
+    for token in re.findall(r"\bMEDIA:\s*([^\s]+)", text, flags=re.IGNORECASE):
+        candidates.append(token)
+
+    for path in re.findall(r"/home/felixlee/\.openclaw/media/inbound/[^\s\]|)]+", text):
+        candidates.append(path)
+
+    for match in re.finditer(r"data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+", text, flags=re.IGNORECASE):
+        candidates.append(match.group(0))
+
+    for url in URL_PATTERN.findall(text):
+        candidates.append(url.rstrip(").,;!?\"'"))
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        clean = normalize_image_source_ref(raw)
+        if not clean:
+            continue
+        if not looks_like_image_source_ref(clean):
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def collect_recent_inbound_images(max_age_seconds: int = 7200, max_items: int = 8) -> List[str]:
+    root = Path(OPENCLAW_INBOUND_MEDIA_PREFIX)
+    try:
+        if not root.exists() or not root.is_dir():
+            return []
+    except OSError:
+        return []
+    now = time.time()
+    picks: List[Tuple[float, Path]] = []
+    for p in root.iterdir():
+        try:
+            if not p.is_file():
+                continue
+            if not IMAGE_EXT_RE.search(p.name):
+                continue
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            continue
+        if (now - mtime) > max_age_seconds:
+            continue
+        picks.append((mtime, p))
+    picks.sort(key=lambda x: x[0], reverse=True)
+    out: List[str] = []
+    for _, p in picks[:max_items]:
+        out.append(str(p))
+    return out
+
+
+def strip_transport_wrapper_text(raw_text: str) -> str:
+    text = str(raw_text or "")
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\[media attached:[^\]]*\]\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"(?im)^\s*To send an image back,.*$", "", text)
+    text = re.sub(
+        r"Conversation info \(untrusted metadata\):\s*```json.*?```",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"(?im)^\s*System:\s*\[[^\]]+\]\s*Exec completed.*$", "", text)
+    return text.strip()
+
+
+def merge_image_sources(primary_image_url: str, extras: Iterable[str], max_items: int = 12) -> List[str]:
+    merged = [str(primary_image_url or "").strip()] + [str(x or "").strip() for x in extras]
+    out: List[str] = []
+    seen: set[str] = set()
+    for idx, raw in enumerate(merged):
+        clean = normalize_image_source_ref(raw)
+        if not clean:
+            continue
+        allow_primary_http = idx == 0 and (
+            clean.casefold().startswith("http://") or clean.casefold().startswith("https://")
+        )
+        if not allow_primary_http and not looks_like_image_source_ref(clean):
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def expand_enquiry_terms(terms: List[str], clean_text: str, max_terms: int = 12) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add_term(raw: str) -> None:
+        t = normalize_space(str(raw or "")).casefold()
+        if not t:
+            return
+        if len(t) < 2:
+            return
+        if t in ENQUIRY_STOPWORDS:
+            return
+        if t in seen:
+            return
+        seen.add(t)
+        out.append(t)
+
+    for term in terms:
+        add_term(term)
+
+    for key in ENQUIRY_TERM_ALIASES.keys():
+        if " " in key and key in clean_text:
+            add_term(key)
+            for alias in ENQUIRY_TERM_ALIASES.get(key, []):
+                add_term(alias)
+
+    idx = 0
+    while idx < len(out):
+        for alias in ENQUIRY_TERM_ALIASES.get(out[idx], []):
+            add_term(alias)
+        idx += 1
+
+    return out[:max_terms]
+
+
+def extract_enquiry_terms(text: str, max_terms: int = 12) -> List[str]:
     clean = decode_html_text(text).casefold()
     if not clean:
         return []
@@ -1285,7 +1576,7 @@ def extract_enquiry_terms(text: str, max_terms: int = 8) -> List[str]:
         out.append(t)
         if len(out) >= max_terms:
             break
-    return out
+    return expand_enquiry_terms(out, clean, max_terms=max_terms)
 
 
 def score_text_against_terms(text: str, terms: List[str], whole_query: str) -> float:
@@ -1353,8 +1644,39 @@ def looks_like_recipe_enquiry(text: str) -> bool:
         has_action = bool(re.search(r"\b(find|search|lookup|look up|show|list)\b", low))
         has_recipe_context = bool(re.search(r"\b(recipe|recipes|saved|history|previous|old)\b", low))
         has_keyword = has_action and has_recipe_context
+        if not has_keyword and has_recipe_context:
+            token_count = len(re.findall(r"[a-z0-9]+|[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+", low))
+            if token_count and token_count <= 8 and ("\n" not in clean) and len(clean) <= 96:
+                has_keyword = True
     has_question = ("?" in clean) or ("？" in clean)
     return has_keyword or has_question
+
+
+def should_try_enquiry_fallback(raw_text: str, validation_missing: List[str]) -> bool:
+    clean = decode_html_text(unescape(str(raw_text or ""))).strip()
+    if not clean:
+        return False
+    if extract_first_url(clean):
+        return False
+    if looks_like_structured_recipe_text(clean):
+        return False
+
+    missing = {normalize_space(str(x)).strip().lower() for x in (validation_missing or []) if str(x).strip()}
+    if not missing:
+        return False
+
+    # Limit fallback to short plain-text inputs where the recipe parser likely
+    # interpreted an enquiry phrase as incomplete recipe text.
+    lines = [normalize_space(x) for x in clean.splitlines() if normalize_space(x)]
+    if len(lines) > 3 or len(clean) > 180:
+        return False
+    if looks_like_recipe_enquiry(clean):
+        return True
+    if "recipe_name" in missing:
+        return False
+    if missing.issubset({"ingredients", "method_steps"}):
+        return True
+    return False
 
 
 def read_text_safely(path: Path, max_chars: int = 250000) -> str:
@@ -2485,6 +2807,7 @@ def extract_source_payload_from_text(raw_text: str) -> Dict[str, Any]:
         "title": title or "Untitled recipe",
         "description": description,
         "image_url": "",
+        "image_urls": [],
         "author": "",
         "prep_time": "",
         "cook_time": "",
@@ -2689,6 +3012,109 @@ def decode_js_escaped_text(value: str) -> str:
     text = text.replace("\\n", "\n").replace("\\r", "\n").replace("\\t", " ")
     text = text.replace('\\"', '"').replace("\\/", "/").replace("\\\\", "\\")
     return normalize_multiline_text(text)
+
+
+def format_seconds_as_timestamp(seconds: float) -> str:
+    try:
+        total = int(float(seconds))
+    except Exception:
+        return ""
+    if total < 0:
+        total = 0
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def extract_youtube_chapter_steps_from_html(html: str, max_items: int = 80) -> List[str]:
+    if not html:
+        return []
+    pattern = re.compile(
+        r'"macroMarkersListItemRenderer":\{"title":\{"simpleText":"((?:[^"\\]|\\.)+)"\},'
+        r'"timeDescription":\{.*?"simpleText":"((?:[^"\\]|\\.)+)"\}',
+        flags=re.DOTALL,
+    )
+    steps: List[str] = []
+    for m in pattern.finditer(html):
+        title = cleanup_title_text(decode_js_escaped_text(m.group(1)))
+        time_text = normalize_space(decode_js_escaped_text(m.group(2)))
+        if not title:
+            continue
+        steps.append(f"{time_text} {title}".strip())
+        if len(steps) >= max_items:
+            break
+    return unique_clean_lines(steps, max_items=max_items)
+
+
+def extract_ytdlp_chapter_steps(meta: Dict[str, Any], max_items: int = 80) -> List[str]:
+    chapters = meta.get("chapters")
+    if not isinstance(chapters, list):
+        return []
+    out: List[str] = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        title = cleanup_title_text(decode_html_text(str(chapter.get("title", ""))))
+        if not title:
+            continue
+        start_text = normalize_space(str(chapter.get("start_time_text", "")))
+        if not start_text:
+            start_text = format_seconds_as_timestamp(chapter.get("start_time", 0.0))
+        out.append(f"{start_text} {title}".strip() if start_text else title)
+        if len(out) >= max_items:
+            break
+    return unique_clean_lines(out, max_items=max_items)
+
+
+def has_meaningful_method_steps(steps: List[str]) -> bool:
+    if not isinstance(steps, list) or not steps:
+        return False
+    useful = 0
+    for raw in steps:
+        line = normalize_space(unescape(str(raw or "")))
+        if not line:
+            continue
+        low = line.casefold()
+        if is_comment_or_social_line(line):
+            continue
+        if line.startswith("#"):
+            continue
+        if re.search(r"https?://", low):
+            continue
+        if re.search(r"\b[\w.\-]+@[\w.\-]+\.\w+\b", low):
+            continue
+        if re.search(r"\b(?:subscribe|follow|sponsor|support my|facebook|instagram|youtube|tiktok|wechat)\b", low):
+            continue
+        if re.search(r"(?:contact|wechat|line id|合作|聯絡|联系|鍋具|锅具|器具|器材|調味料品牌|品牌)", line, flags=re.IGNORECASE):
+            continue
+        if extract_inline_ingredient_items(line, max_items=2):
+            continue
+        if re.search(
+            r"\d+(?:\.\d+)?\s*(?:kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cups?|pcs?|pc|克|公斤|毫升|公升|茶匙|湯匙|汤匙|大匙|小匙|條|条|隻|只|個|个|片|塊|块|顆|颗|粒)",
+            low,
+            flags=re.IGNORECASE,
+        ) and len(line) <= 90:
+            continue
+        if len(line) < 8:
+            continue
+        if not (
+            re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\b", line)
+            or re.match(r"^\s*(\d{1,2}|[一二三四五六七八九十])[\.、\):：]\s*", line)
+            or re.search(
+                r"\b(?:add|mix|stir|whisk|beat|fold|bake|cook|fry|boil|simmer|heat|preheat|pour|combine|transfer|rest|cool|serve)\b",
+                low,
+            )
+            or re.search(r"(?:加入|混合|攪拌|搅拌|打發|打发|烘烤|烤|煎|炒|煮|蒸|倒入|預熱|预热|冷卻|冷却|切|拌)", line)
+            or re.search(r"(?:混ぜ|加え|焼|煮|蒸|温め|予熱|入れ|泡立)", line)
+            or re.search(r"(?:넣|섞|볶|끓|굽|예열|데우|익히)", line)
+        ):
+            continue
+        useful += 1
+    threshold = 2 if len(steps) <= 3 else 3
+    return useful >= threshold
 
 
 def extract_youtube_fast_fields_from_html(html: str) -> Dict[str, str]:
@@ -3486,6 +3912,188 @@ def download_image_for_embed(image_url: str) -> Tuple[bytes, str, str, str]:
     return b"", "", "", last_err
 
 
+def is_allowed_local_image_path(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    resolved_str = f"{str(resolved)}/" if resolved.is_dir() else str(resolved)
+    for prefix in LOCAL_IMAGE_ALLOWED_PREFIXES:
+        try:
+            allowed = str(Path(prefix).expanduser().resolve(strict=False)).rstrip("/") + "/"
+        except Exception:
+            continue
+        if resolved_str.startswith(allowed):
+            return True
+    return False
+
+
+def read_local_image_for_embed(image_path: str) -> Tuple[bytes, str, str, str]:
+    if not image_path:
+        return b"", "", "", "missing local image path"
+    path = Path(image_path).expanduser()
+    if not is_allowed_local_image_path(path):
+        return b"", "", "", f"local image path not allowed: {image_path}"
+    if not path.exists() or not path.is_file():
+        return b"", "", "", f"local image path not found: {image_path}"
+    try:
+        image_bytes = path.read_bytes()
+    except Exception as exc:
+        return b"", "", "", f"local image read failed ({exc.__class__.__name__}: {exc})"
+    if not image_bytes:
+        return b"", "", "", "local image is empty"
+    if len(image_bytes) > MAX_EMBED_IMAGE_BYTES:
+        return b"", "", "", f"image too large ({len(image_bytes)} bytes > {MAX_EMBED_IMAGE_BYTES} bytes)"
+    mime, _ = mimetypes.guess_type(path.name)
+    mime = normalize_image_mime(mime or "image/jpeg")
+    if mime in DOCS_SUPPORTED_IMAGE_MIME:
+        ext = mimetypes.guess_extension(mime) or ".jpg"
+        return image_bytes, mime, f"chief-fafa-local{ext}", ""
+    converted, conv_err = convert_image_bytes_to_jpeg(image_bytes)
+    if converted:
+        if len(converted) > MAX_EMBED_IMAGE_BYTES:
+            return b"", "", "", f"converted image too large ({len(converted)} bytes > {MAX_EMBED_IMAGE_BYTES} bytes)"
+        return converted, "image/jpeg", "chief-fafa-local.jpg", ""
+    return b"", "", "", f"unsupported local image format for Docs: {mime} ({conv_err})"
+
+
+def decode_data_uri_image_for_embed(image_data_uri: str) -> Tuple[bytes, str, str, str]:
+    raw = str(image_data_uri or "").strip()
+    if not raw:
+        return b"", "", "", "missing data image"
+    match = DATA_IMAGE_RE.match(raw)
+    if not match:
+        return b"", "", "", "invalid data image format"
+    mime = normalize_image_mime(match.group(1))
+    encoded = re.sub(r"\s+", "", match.group(2))
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        return b"", "", "", f"invalid data image payload ({exc.__class__.__name__}: {exc})"
+    if not image_bytes:
+        return b"", "", "", "data image is empty"
+    if len(image_bytes) > MAX_EMBED_IMAGE_BYTES:
+        return b"", "", "", f"image too large ({len(image_bytes)} bytes > {MAX_EMBED_IMAGE_BYTES} bytes)"
+    if mime in DOCS_SUPPORTED_IMAGE_MIME:
+        ext = mimetypes.guess_extension(mime) or ".jpg"
+        return image_bytes, mime, f"chief-fafa-data{ext}", ""
+    converted, conv_err = convert_image_bytes_to_jpeg(image_bytes)
+    if converted:
+        if len(converted) > MAX_EMBED_IMAGE_BYTES:
+            return b"", "", "", f"converted image too large ({len(converted)} bytes > {MAX_EMBED_IMAGE_BYTES} bytes)"
+        return converted, "image/jpeg", "chief-fafa-data.jpg", ""
+    return b"", "", "", f"unsupported data image format for Docs: {mime} ({conv_err})"
+
+
+def resolve_image_source_for_embed(image_source: str) -> Tuple[bytes, str, str, str]:
+    source = normalize_image_source_ref(image_source)
+    if not source:
+        return b"", "", "", "missing image source"
+    if source.casefold().startswith("data:image/"):
+        return decode_data_uri_image_for_embed(source)
+    if source.casefold().startswith("http://") or source.casefold().startswith("https://"):
+        return download_image_for_embed(source)
+    if os.path.isabs(source):
+        return read_local_image_for_embed(source)
+    return b"", "", "", f"unsupported image source: {source}"
+
+
+def insert_image_with_uri_candidates(
+    document_id: str,
+    access_token: str,
+    quota_project: str,
+    uri_candidates: List[str],
+    insert_index: Optional[int],
+) -> str:
+    insert_err = ""
+    for idx, uri_candidate in enumerate(uri_candidates):
+        insert_err = insert_image_into_doc(
+            document_id=document_id,
+            access_token=access_token,
+            quota_project=quota_project,
+            image_uri=uri_candidate,
+            insert_index=insert_index,
+        )
+        if not insert_err:
+            return ""
+        is_retrieval_issue = "problem retrieving the image" in insert_err.casefold()
+        if is_retrieval_issue and idx < (len(uri_candidates) - 1):
+            time.sleep(1.2)
+            continue
+        if is_retrieval_issue and idx == (len(uri_candidates) - 1):
+            time.sleep(1.6)
+            insert_err = insert_image_into_doc(
+                document_id=document_id,
+                access_token=access_token,
+                quota_project=quota_project,
+                image_uri=uri_candidate,
+                insert_index=insert_index,
+            )
+            if not insert_err:
+                return ""
+    return insert_err
+
+
+def embed_single_image_source_into_doc(
+    document_id: str,
+    access_token: str,
+    quota_project: str,
+    image_source: str,
+    insert_index: Optional[int],
+    fast_mode: bool,
+) -> Tuple[bool, str]:
+    source = normalize_image_source_ref(image_source)
+    if not source:
+        return False, "empty image source"
+
+    if (source.casefold().startswith("http://") or source.casefold().startswith("https://")) and fast_mode:
+        fast_err = insert_image_with_uri_candidates(
+            document_id=document_id,
+            access_token=access_token,
+            quota_project=quota_project,
+            uri_candidates=candidate_image_urls_for_embed(source),
+            insert_index=insert_index,
+        )
+        if not fast_err:
+            return True, ""
+
+    image_bytes, mime_type, filename, resolve_err = resolve_image_source_for_embed(source)
+    if resolve_err:
+        return False, resolve_err
+
+    drive_uri, drive_err = upload_image_to_drive_for_embed(
+        access_token=access_token,
+        quota_project=quota_project,
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        filename=filename,
+    )
+    if drive_err:
+        if source.casefold().startswith("http://") or source.casefold().startswith("https://"):
+            fallback_err = insert_image_with_uri_candidates(
+                document_id=document_id,
+                access_token=access_token,
+                quota_project=quota_project,
+                uri_candidates=candidate_image_urls_for_embed(source),
+                insert_index=insert_index,
+            )
+            if not fallback_err:
+                return True, ""
+            return False, f"{fallback_err}; Drive fallback reason: {drive_err}"
+        return False, f"Drive upload failed: {drive_err}"
+
+    drive_insert_err = insert_image_with_uri_candidates(
+        document_id=document_id,
+        access_token=access_token,
+        quota_project=quota_project,
+        uri_candidates=drive_image_uri_candidates(drive_uri),
+        insert_index=insert_index,
+    )
+    if drive_insert_err:
+        return False, drive_insert_err
+    return True, ""
+
+
 def upload_image_to_drive_for_embed(
     access_token: str,
     quota_project: str,
@@ -3779,7 +4387,7 @@ def insert_text_into_doc(
     return ""
 
 
-def create_google_doc_note(title: str, body: str, image_url: str = "") -> Dict[str, Any]:
+def create_google_doc_note(title: str, body: str, image_url: str = "", image_sources: Optional[List[str]] = None) -> Dict[str, Any]:
     fast_mode = is_fast_mode_enabled()
     token, err = resolve_docs_access_token()
     if not token:
@@ -3854,8 +4462,8 @@ def create_google_doc_note(title: str, body: str, image_url: str = "") -> Dict[s
         marker=DOC_IMAGE_MARKER,
     )
 
-    if image_url and fast_mode:
-        # Fast mode: avoid Drive upload roundtrips and try direct-source embed first.
+    all_image_sources = merge_image_sources(image_url, image_sources or [])
+    if all_image_sources:
         target_index: Optional[int]
         if marker_start > 0 and marker_end > marker_start:
             delete_err = delete_text_range_in_doc(
@@ -3876,126 +4484,56 @@ def create_google_doc_note(title: str, body: str, image_url: str = "") -> Dict[s
         else:
             target_index = None
 
-        insert_err = ""
-        for uri_candidate in candidate_image_urls_for_embed(image_url):
-            insert_err = insert_image_into_doc(
+        embed_errors: List[str] = []
+        embedded_count = 0
+        for source in all_image_sources:
+            ok, embed_err = embed_single_image_source_into_doc(
                 document_id=document_id,
                 access_token=token,
                 quota_project=quota_project,
-                image_uri=uri_candidate,
+                image_source=source,
                 insert_index=target_index,
+                fast_mode=fast_mode,
             )
-            if not insert_err:
-                break
-
-        if insert_err:
-            if marker_start > 0 and marker_end > marker_start:
-                insert_text_into_doc(
-                    document_id=document_id,
-                    access_token=token,
-                    quota_project=quota_project,
-                    index=marker_start,
-                    text="(image unavailable)\n",
-                )
-            image_embed_note = f" (fast mode: image unavailable - {insert_err})"
-        else:
-            image_embed_note = " (image embedded, fast mode)"
-    elif image_url:
-        image_bytes, mime_type, filename, download_err = download_image_for_embed(image_url)
-        if download_err:
-            if marker_start > 0 and marker_end > marker_start:
-                delete_text_range_in_doc(
-                    document_id=document_id,
-                    access_token=token,
-                    quota_project=quota_project,
-                    start_index=marker_start,
-                    end_index=marker_end,
-                )
-                insert_text_into_doc(
-                    document_id=document_id,
-                    access_token=token,
-                    quota_project=quota_project,
-                    index=marker_start,
-                    text="(image unavailable)\n",
-                )
-            return {
-                "ok": False,
-                "message": f"created, but image embed failed: {download_err}",
-                "document_id": document_id,
-                "url": doc_url,
-            }
-
-        drive_uri, drive_err = upload_image_to_drive_for_embed(
-            access_token=token,
-            quota_project=quota_project,
-            image_bytes=image_bytes,
-            mime_type=mime_type,
-            filename=filename,
-        )
-        # Fallback: if Drive upload is unavailable (scope/quota), try embedding from source URI.
-        image_uri = drive_uri if not drive_err else image_url
-        if marker_start > 0 and marker_end > marker_start:
-            delete_err = delete_text_range_in_doc(
-                document_id=document_id,
-                access_token=token,
-                quota_project=quota_project,
-                start_index=marker_start,
-                end_index=marker_end,
-            )
-            if delete_err:
-                return {
-                    "ok": False,
-                    "message": f"created, but image marker cleanup failed: {delete_err}",
-                    "document_id": document_id,
-                    "url": doc_url,
-                }
-            target_index = marker_start
-        else:
-            target_index = None
-        uri_candidates = [image_uri]
-        if drive_uri and not drive_err:
-            uri_candidates = drive_image_uri_candidates(drive_uri)
-        insert_err = ""
-        for idx, uri_candidate in enumerate(uri_candidates):
-            insert_err = insert_image_into_doc(
-                document_id=document_id,
-                access_token=token,
-                quota_project=quota_project,
-                image_uri=uri_candidate,
-                insert_index=target_index,
-            )
-            if not insert_err:
-                break
-            is_retrieval_issue = "problem retrieving the image" in insert_err.casefold()
-            if is_retrieval_issue and idx < (len(uri_candidates) - 1):
-                time.sleep(1.2)
+            if ok:
+                embedded_count += 1
+                if target_index is not None:
+                    sep_err = insert_text_into_doc(
+                        document_id=document_id,
+                        access_token=token,
+                        quota_project=quota_project,
+                        index=target_index + 1,
+                        text="\n",
+                    )
+                    if sep_err:
+                        embed_errors.append(f"separator insert failed: {sep_err}")
+                    target_index += 2
                 continue
-            if is_retrieval_issue and idx == (len(uri_candidates) - 1):
-                # One final retry after a short delay for Drive permission/index propagation.
-                time.sleep(1.6)
-                insert_err = insert_image_into_doc(
+            embed_errors.append(embed_err)
+
+        if embedded_count == 0:
+            if marker_start > 0:
+                insert_text_into_doc(
                     document_id=document_id,
                     access_token=token,
                     quota_project=quota_project,
-                    image_uri=uri_candidate,
-                    insert_index=target_index,
+                    index=marker_start,
+                    text="(image unavailable)\n",
                 )
-                if not insert_err:
-                    break
-        if insert_err:
-            base = f"{insert_err}"
-            if drive_err:
-                base = f"{base}; Drive fallback reason: {drive_err}"
+            first_err = normalize_space(embed_errors[0]) if embed_errors else "unknown image error"
             return {
                 "ok": False,
-                "message": f"created, but image embed failed: {base}",
+                "message": f"created, but image embed failed: {first_err}",
                 "document_id": document_id,
                 "url": doc_url,
             }
-        if drive_err:
-            image_embed_note = f" (image embedded via source URL; Drive fallback: {drive_err})"
+
+        if embed_errors:
+            tail = "; ".join([normalize_space(x) for x in embed_errors[:2] if normalize_space(x)])
+            image_embed_note = f" ({embedded_count}/{len(all_image_sources)} images embedded; partial: {tail})"
         else:
-            image_embed_note = " (image embedded)"
+            suffix = "s" if embedded_count != 1 else ""
+            image_embed_note = f" ({embedded_count} image{suffix} embedded)"
     else:
         if marker_start > 0 and marker_end > marker_start:
             delete_text_range_in_doc(
@@ -4201,6 +4739,7 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
     video_description = first_non_empty([video_fields.get("description"), description])
     video_transcript = ""
     video_note = ""
+    video_chapter_steps: List[str] = []
     if is_video_source:
         fast_mode = is_fast_mode_enabled()
         if fast_mode and is_youtube_source:
@@ -4215,13 +4754,22 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
                     image_url,
                 ]
             )
+            video_chapter_steps = extract_youtube_chapter_steps_from_html(html, max_items=80)
 
-        need_enrichment = not (fast_mode and is_youtube_source and has_meaningful_text(video_description, min_chars=40))
+        has_rich_description = has_meaningful_text(video_description, min_chars=40)
+        steps_need_help = not has_meaningful_method_steps(all_steps)
+        need_enrichment = (not (fast_mode and is_youtube_source and has_rich_description)) or steps_need_help
         if need_enrichment:
             enriched = extract_video_text_sources(final_url, video_description)
             video_description = first_non_empty([enriched.get("description", ""), video_description])
             video_transcript = normalize_multiline_text(str(enriched.get("transcript", "")))
             video_note = decode_html_text(str(enriched.get("error", "")))
+            enriched_chapter_steps = sanitize_recipe_lines_for_doc(
+                normalize_multiline_text(str(enriched.get("chapters", ""))).splitlines(),
+                max_items=80,
+            )
+            if enriched_chapter_steps:
+                video_chapter_steps = unique_clean_lines(video_chapter_steps + enriched_chapter_steps, max_items=80)
             title = first_non_empty([enriched.get("title", ""), video_fields.get("name"), title, urlparse(final_url).netloc])
             image_url = first_non_empty(
                 [
@@ -4235,12 +4783,18 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
         desc_ingredients, desc_steps = extract_recipe_sections_from_text_blob(video_description)
         all_ingredients = unique_clean_lines(list(all_ingredients) + desc_ingredients, max_items=260)
         all_steps = unique_clean_lines(list(all_steps) + desc_steps, max_items=320)
-        if (not all_ingredients or not all_steps) and video_transcript:
+        steps_meaningful = has_meaningful_method_steps(all_steps)
+        if (not all_ingredients or not steps_meaningful) and video_transcript:
             transcript_ingredients, transcript_steps = extract_recipe_sections_from_text_blob(video_transcript)
             if not all_ingredients:
                 all_ingredients = unique_clean_lines(list(all_ingredients) + transcript_ingredients, max_items=260)
-            if not all_steps:
-                all_steps = unique_clean_lines(list(all_steps) + transcript_steps, max_items=320)
+            if not steps_meaningful and transcript_steps:
+                all_steps = unique_clean_lines(transcript_steps, max_items=320)
+                steps_meaningful = has_meaningful_method_steps(all_steps)
+        if video_chapter_steps and not has_meaningful_method_steps(all_steps):
+            all_steps = unique_clean_lines(video_chapter_steps, max_items=320)
+        if not has_meaningful_method_steps(all_steps) and not video_chapter_steps:
+            all_steps = []
         video_blob = "\n\n".join([video_description, video_transcript]).strip()
         if not text_excerpt and video_blob:
             text_excerpt = video_blob[:2400]
@@ -4279,6 +4833,7 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
         "title": title,
         "description": description,
         "image_url": image_url,
+        "image_urls": [image_url] if image_url else [],
         "author": recipe_fields.get("author", ""),
         "prep_time": recipe_fields.get("prep_time", ""),
         "cook_time": recipe_fields.get("cook_time", ""),
@@ -4346,6 +4901,13 @@ def main() -> None:
         stdin_payload = sys.stdin.read()
         if stdin_payload and stdin_payload.strip():
             raw_source = stdin_payload.strip()
+    inbound_image_sources = collect_media_image_sources(raw_source)
+    if not inbound_image_sources and (
+        "<image_attachment_here>" in raw_source.casefold()
+        or "media attached" in raw_source.casefold()
+    ):
+        inbound_image_sources = collect_recent_inbound_images(max_age_seconds=45 * 60, max_items=6)
+    raw_source = strip_transport_wrapper_text(raw_source)
 
     output_dir = Path(args.output_dir)
     try:
@@ -4510,6 +5072,7 @@ def main() -> None:
             "title": "Input missing",
             "description": "",
             "image_url": "",
+            "image_urls": [],
             "ingredients": [],
             "instructions": [],
             "text_excerpt": "",
@@ -4532,6 +5095,7 @@ def main() -> None:
                 "title": "Source fetch unavailable",
                 "description": "",
                 "image_url": "",
+                "image_urls": [],
                 "ingredients": [],
                 "instructions": [],
                 "text_excerpt": raw_source[:2400],
@@ -4541,12 +5105,75 @@ def main() -> None:
             source_error = f"{exc.__class__.__name__}: {exc}"
             source["source_error"] = source_error
 
+    source_base_image_urls = source.get("image_urls", [])
+    if not isinstance(source_base_image_urls, list):
+        source_base_image_urls = []
+    merged_images = merge_image_sources(
+        str(source.get("image_url", "")),
+        list(source_base_image_urls) + inbound_image_sources,
+    )
+    source["image_urls"] = merged_images
+    source["image_url"] = merged_images[0] if merged_images else ""
+
     validation_missing = source.get("input_validation_missing", [])
     if not isinstance(validation_missing, list):
         validation_missing = []
     validation_error = ""
     if str(source.get("content_type", "")).strip().lower() == "text_recipe_input" and validation_missing:
         validation_error = f"text recipe missing required fields: {summarize_text_recipe_validation([str(x) for x in validation_missing])}"
+        if should_try_enquiry_fallback(raw_source, [str(x) for x in validation_missing]):
+            lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
+            lookup_results = lookup.get("results", [])
+            lookup_has_match = bool(lookup_results) or (
+                str(lookup.get("google_doc_status", "")).strip().lower() in {"found", "exists"}
+            )
+            if lookup_has_match:
+                stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+                slug = slugify(f"enquiry-{lookup.get('query', '')}")
+                report_path = output_dir / f"{stamp}-{slug}.md"
+                report_markdown = format_enquiry_markdown_report(lookup)
+                report_path.write_text(report_markdown, encoding="utf-8")
+                if args.json:
+                    if args.json_brief:
+                        summary = str(lookup.get("summary", "")).strip()
+                        google_doc_status = str(lookup.get("google_doc_status", "not_found")).strip()
+                        google_doc_url = str(lookup.get("google_doc_url", "")).strip()
+                        error_message = str(lookup.get("error_message", "")).strip()
+                        brief = {
+                            "ok": True,
+                            "summary": summary,
+                            "google_doc_status": google_doc_status,
+                            "google_doc_url": google_doc_url,
+                            "error_message": error_message,
+                            "reply_message": build_reply_message(
+                                summary=summary,
+                                google_doc_status=google_doc_status,
+                                google_doc_url=google_doc_url,
+                                error_message=error_message,
+                            ),
+                            "lookup": lookup,
+                            "auto_review_triggers": auto_review_triggers,
+                            "report_path": str(report_path),
+                        }
+                        print(json.dumps(brief, ensure_ascii=True, indent=2))
+                    else:
+                        print(
+                            json.dumps(
+                                {
+                                    "ok": True,
+                                    "mode": "enquiry",
+                                    "query": lookup.get("query", ""),
+                                    "report_path": str(report_path),
+                                    "lookup": lookup,
+                                },
+                                ensure_ascii=True,
+                                indent=2,
+                            )
+                        )
+                else:
+                    print(report_markdown)
+                    print(f"Report saved: {report_path}")
+                return
 
     ai_err = ""
     if validation_error:
@@ -4586,7 +5213,12 @@ def main() -> None:
     elif not args.no_doc and not args.no_keep:
         note_title = f"Chief Fafa - {source.get('title', 'Recipe')}"[:120]
         note_body = build_google_doc_recipe_text(source, summary_for_doc)
-        note_result = create_google_doc_note(note_title, note_body, str(source.get("image_url", "")))
+        note_result = create_google_doc_note(
+            note_title,
+            note_body,
+            str(source.get("image_url", "")),
+            image_sources=[str(x) for x in source.get("image_urls", []) if str(x).strip()],
+        )
 
     doc_validation_error = ""
     note_doc_url = str(note_result.get("url", "")).strip()
@@ -4617,6 +5249,7 @@ def main() -> None:
         "url": source.get("url", ""),
         "title": source.get("title", ""),
         "image_url": source.get("image_url", ""),
+        "image_urls": source.get("image_urls", []),
         "doc": note_result,
         "note": note_result,
         "auto_review_triggers": auto_review_triggers,

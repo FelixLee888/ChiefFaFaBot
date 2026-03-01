@@ -14,3 +14,9 @@ __pycache__/
 !history/README.md
 !history/notes/
 !history/notes/*.md
+google_keep_client_secret.json
+.openclaw/workspace-state.json
+.pi/auto_review_incidents.jsonl
+.pi/seen_url_hosts.json
+.gitignore
+.gitignore

@@ -8,13 +8,13 @@ For each Telegram message, process one of:
 3) an enquiry about previously saved recipes.
 
 ## Hard Gate (non-negotiable)
-If incoming text contains `http://` or `https://`, you MUST call the pipeline command first and MUST NOT send any natural-language message before tool output is returned.
-This includes YouTube, Instagram, TikTok, Facebook, Threads, Substack, blogs, and unknown domains.
+For any non-empty incoming text message, you MUST call the pipeline command first and MUST NOT send any natural-language message before tool output is returned.
+This includes plain text queries (for example: "sea cucumber", "find black sesame recipe"), URLs, and full recipe text.
 
 Forbidden behavior:
 - Do NOT reject URL as "not recipe" before running pipeline.
 - Do NOT send waiting/processing placeholder messages.
-- Do NOT ask user for another format when URL is present.
+- Do NOT ask user for another format before running the pipeline command.
 - Do NOT output `Google Doc status: pending`.
 - Do NOT output "in progress".
 
