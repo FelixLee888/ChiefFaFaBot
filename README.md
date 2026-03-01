@@ -1,6 +1,6 @@
 # Chef Fafa Bot
 
-Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, extracts recipe data, and creates a Google Doc note.
+Chef Fafa Bot is a Telegram/OpenClaw recipe agent that accepts URL or text input, extracts recipe data, and creates a Google Doc note.
 
 ## Features
 
@@ -10,6 +10,8 @@ Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, e
 - Duplicate URL detection before creating a new document
 - Google Docs generation with structured recipe format and image embedding (best-effort)
 - Stable chat payload via `--json --json-brief` including `reply_message` for direct Telegram reply
+- Language-aware replies: output follows user input language (`en`, `zh-Hant`, `zh-Hans`, `ja`, `ko`)
+- Short CJK input handling (for example `海參`, `海参`) so enquiry replies do not fall back to English
 
 ## Infrastructure Diagram
 
@@ -113,12 +115,15 @@ python3 scripts/chief_fafa_recipe_pipeline.py "find my black sesame recipe" --js
 
 - 3 lines when no error (`Error:` omitted)
 - 4 lines only when `error_message` is non-empty
+- Must be sent verbatim by the agent (no paraphrase/translation/rewrite)
+- Language of `reply_message` follows detected user input language
 
 ## OpenClaw Integration Notes
 
 - Bind Telegram account `chieffafa` to agent `chief-fafa`.
 - Keep command execution in `CHIEF_FAFA_FAST_MODE=1` for responsiveness.
 - Agent instructions should send `brief.reply_message` verbatim.
+- Agent instructions should not translate `brief.reply_message`; preserve pipeline language.
 - `process` tool is intentionally denied for `chief-fafa` to avoid interim placeholder replies.
 
 ## Troubleshooting
@@ -131,6 +136,8 @@ python3 scripts/chief_fafa_recipe_pipeline.py "find my black sesame recipe" --js
   - Expected behavior; pipeline reuses prior document URL.
 - Telegram response includes unexpected formatting:
   - Ensure agent prompt/instructions still enforce `reply_message` passthrough.
+- Chinese/Japanese/Korean query responded in English:
+  - Ensure latest pipeline is deployed (short CJK language detection update) and AGENTS prompt is synced.
 
 ## Security
 
