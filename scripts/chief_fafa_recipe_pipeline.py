@@ -51,6 +51,7 @@ DOCS_SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif"}
 TRANSCRIPT_MAX_CHARS = 24000
 VIDEO_TEXT_MAX_CHARS = 24000
 TRANSCRIPT_MODEL = "gpt-4o-mini-transcribe"
+SUMMARY_MODEL = "gpt-4o-mini"
 DOC_IMAGE_MARKER = "[[CHIEF_FAFA_IMAGE_HERE]]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", flags=re.IGNORECASE)
 DATA_IMAGE_RE = re.compile(r"^data:(image/[a-z0-9.+-]+);base64,(.+)$", flags=re.IGNORECASE | re.DOTALL)
@@ -576,6 +577,104 @@ def split_step_candidates(text: str) -> List[str]:
     return chunks
 
 
+def extract_method_like_steps_from_free_text(text: str, max_items: int = 60) -> List[str]:
+    clean = normalize_multiline_text(decode_html_text(text))
+    if not clean:
+        return []
+    action_pattern = re.compile(
+        r"(?:\b(?:add|mix|stir|whisk|beat|fold|bake|cook|fry|boil|simmer|heat|preheat|pour|combine|transfer|rest|cool|serve|marinate|season|slice|chop|mince|drain)\b|"
+        r"(?:加入|混合|攪拌|搅拌|打發|打发|烘烤|烤|煎|炒|煮|蒸|倒入|預熱|预热|冷卻|冷却|切|拌|醃|腌|調味|调味|收汁)|"
+        r"(?:混ぜ|加え|焼|煮|蒸|温め|予熱|入れ|泡立|切る|炒め|和える)|"
+        r"(?:넣|섞|볶|끓|굽|예열|데우|익히|자르|다지|양념))",
+        flags=re.IGNORECASE,
+    )
+    candidates: List[str] = []
+    for raw_line in clean.splitlines():
+        line = normalize_space(raw_line)
+        if not line:
+            continue
+        if is_noise_or_error_line(line) or is_comment_or_social_line(line):
+            continue
+        if re.search(r"https?://", line, flags=re.IGNORECASE):
+            continue
+        parts = re.split(r"(?<=[。！？；;])|(?<=[.!?])\s+", line)
+        for part in parts:
+            subparts = [part]
+            if len(part) > 220:
+                split_by_commas = [normalize_space(x) for x in re.split(r"[，,、]\s*", part) if normalize_space(x)]
+                if split_by_commas:
+                    subparts = split_by_commas
+            for sub in subparts:
+                s = normalize_space(sub)
+                if not s or len(s) < 8 or len(s) > 320:
+                    continue
+                if re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\b", s) or action_pattern.search(s):
+                    candidates.append(s)
+            if len(candidates) >= max_items * 3:
+                break
+        if len(candidates) >= max_items * 3:
+            break
+    primary = unique_clean_lines(candidates, max_items=max_items)
+    if primary:
+        return primary
+
+    # As last resort, keep readable transcript chunks so methods section is not empty.
+    fallback: List[str] = []
+    for raw_line in clean.splitlines():
+        line = normalize_space(raw_line)
+        if not line:
+            continue
+        if is_noise_or_error_line(line) or is_comment_or_social_line(line):
+            continue
+        if re.match(r"^(?:kind|language)\s*:", line, flags=re.IGNORECASE):
+            continue
+        pieces = re.split(r"(?<=[。！？；;])|(?<=[.!?])\s+|[，,、]\s*", line)
+        for piece in pieces:
+            s = normalize_space(piece)
+            if not s or len(s) < 10 or len(s) > 220:
+                continue
+            fallback.append(s)
+            if len(fallback) >= max_items:
+                break
+        if len(fallback) >= max_items:
+            break
+    return unique_clean_lines(fallback, max_items=max_items)
+
+
+def filter_instruction_like_steps(steps: List[str], min_keep: int = 3, max_items: int = 320) -> List[str]:
+    action_pattern = re.compile(
+        r"(?:\b(?:add|mix|stir|whisk|beat|fold|bake|cook|fry|boil|simmer|heat|preheat|pour|combine|transfer|rest|cool|serve|marinate|season|slice|chop|mince|drain)\b|"
+        r"(?:加入|混合|攪拌|搅拌|打發|打发|烘烤|烤|煎|炒|煮|蒸|倒入|預熱|预热|冷卻|冷却|切|拌|醃|腌|調味|调味|收汁)|"
+        r"(?:混ぜ|加え|焼|煮|蒸|温め|予熱|入れ|泡立|切る|炒め|和える)|"
+        r"(?:넣|섞|볶|끓|굽|예열|데우|익히|자르|다지|양념))",
+        flags=re.IGNORECASE,
+    )
+    cleaned = unique_clean_lines([str(x) for x in (steps or [])], max_items=max_items)
+    if not cleaned:
+        return []
+    filtered: List[str] = []
+    for step in cleaned:
+        line = normalize_space(step)
+        if not line:
+            continue
+        if is_noise_or_error_line(line) or is_comment_or_social_line(line):
+            continue
+        if line.count("/") >= 2 and not re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\b", line):
+            continue
+        if re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\b", line):
+            filtered.append(line)
+            continue
+        if re.match(r"^\s*(\d{1,2}|[一二三四五六七八九十])[\.、\):：]\s*", line):
+            filtered.append(line)
+            continue
+        if action_pattern.search(line):
+            filtered.append(line)
+            continue
+    if len(filtered) >= max(1, min_keep):
+        return unique_clean_lines(filtered, max_items=max_items)
+    return cleaned
+
+
 def html_to_text_lines(html: str) -> List[str]:
     html = strip_comment_sections_html(html)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
@@ -871,19 +970,42 @@ def extract_video_text_sources(final_url: str, initial_description: str) -> Dict
         out["chapters"] = "\n".join(chapter_steps)
 
     preferred_lang = str(meta.get("language", "")).strip()
-    subtitle_url = select_caption_track_url(meta.get("subtitles"), preferred_lang=preferred_lang)
-    if not subtitle_url:
-        subtitle_url = select_caption_track_url(meta.get("automatic_captions"), preferred_lang=preferred_lang)
+    lang_hint_blob = "\n".join(
+        [
+            normalize_multiline_text(initial_description),
+            normalize_multiline_text(str(meta.get("description", ""))),
+            normalize_multiline_text(str(meta.get("title", ""))),
+        ]
+    ).strip()
+    profile = script_profile(lang_hint_blob)
+    han = int(profile.get("han", 0))
+    hirakata = int(profile.get("hirakata", 0))
+    hangul = int(profile.get("hangul", 0))
+    latin = int(profile.get("latin", 0))
+    if han >= max(20, int(latin * 0.35)):
+        preferred_lang = "zh"
+    elif hirakata >= max(12, int(latin * 0.25)):
+        preferred_lang = "ja"
+    elif hangul >= max(12, int(latin * 0.25)):
+        preferred_lang = "ko"
+    subtitle_urls = select_caption_track_urls(meta.get("subtitles"), preferred_lang=preferred_lang, limit=8)
+    auto_urls = select_caption_track_urls(meta.get("automatic_captions"), preferred_lang=preferred_lang, limit=8)
+    if auto_urls:
+        for u in auto_urls:
+            if u not in subtitle_urls:
+                subtitle_urls.append(u)
 
     transcript_text = ""
     transcript_err = ""
-    if subtitle_url:
-        transcript_text, transcript_err = fetch_caption_text(subtitle_url)
+    desc_has_steps = description_has_method_detail(out.get("description", ""))
+    force_transcribe = env_flag("CHIEF_FAFA_FORCE_TRANSCRIBE_FOR_STEPS", True)
+    openai_first = env_flag("CHIEF_FAFA_VIDEO_OPENAI_TRANSCRIBE_FIRST", True)
+    transcribe_always = env_flag("CHIEF_FAFA_VIDEO_TRANSCRIBE_ALWAYS", True)
+    attempted_openai_transcribe = False
 
-    need_transcription = (not transcript_text) and (not has_meaningful_text(out.get("description", ""), min_chars=24))
-    if need_transcription and is_fast_mode_enabled():
-        transcript_err = "fast mode skipped audio transcription"
-    elif need_transcription:
+    # OpenAI transcript first for video sources (user-requested default behavior).
+    if openai_first and force_transcribe and (transcribe_always or (not desc_has_steps)):
+        attempted_openai_transcribe = True
         audio_path, audio_err = download_video_audio_with_ytdlp(final_url)
         if audio_path:
             transcript_text, transcript_err = transcribe_audio_with_openai(audio_path)
@@ -894,6 +1016,57 @@ def extract_video_text_sources(final_url: str, initial_description: str) -> Dict
                 pass
         else:
             transcript_err = audio_err
+
+    transcript_has_steps = description_has_method_detail(transcript_text)
+    transcript_compact_len = len(re.sub(r"\s+", "", transcript_text or ""))
+    transcript_is_sparse = transcript_compact_len < 120
+
+    # Caption fallback if transcript is unavailable/weak.
+    if (not transcript_text) or transcript_is_sparse or (not transcript_has_steps):
+        for subtitle_url in subtitle_urls[:12]:
+            candidate_text, candidate_err = fetch_caption_text(subtitle_url)
+            if not candidate_text:
+                if candidate_err and not transcript_err:
+                    transcript_err = candidate_err
+                continue
+            candidate_has_steps = description_has_method_detail(candidate_text)
+            if (not transcript_text) or (len(candidate_text) > len(transcript_text) + 80) or (candidate_has_steps and not transcript_has_steps):
+                transcript_text = candidate_text
+                transcript_err = ""
+                transcript_has_steps = candidate_has_steps
+                transcript_compact_len = len(re.sub(r"\s+", "", transcript_text or ""))
+                transcript_is_sparse = transcript_compact_len < 120
+            if transcript_text and (not transcript_is_sparse):
+                break
+
+    # If direct timedtext fetch is sparse/weak, retry subtitle extraction via yt-dlp files.
+    if (not desc_has_steps) and ((not transcript_text) or transcript_is_sparse or (not transcript_has_steps)):
+        ytdlp_caption_text, ytdlp_caption_err = fetch_caption_text_with_ytdlp(final_url, preferred_lang=preferred_lang)
+        if ytdlp_caption_text:
+            ytdlp_has_steps = description_has_method_detail(ytdlp_caption_text)
+            if (not transcript_text) or (len(ytdlp_caption_text) > len(transcript_text) + 80) or (ytdlp_has_steps and not transcript_has_steps):
+                transcript_text = ytdlp_caption_text
+                transcript_err = ""
+                transcript_has_steps = ytdlp_has_steps
+                transcript_compact_len = len(re.sub(r"\s+", "", transcript_text or ""))
+                transcript_is_sparse = transcript_compact_len < 120
+        elif ytdlp_caption_err and not transcript_err:
+            transcript_err = ytdlp_caption_err
+
+    need_transcription = (not desc_has_steps) and ((not transcript_text) or transcript_is_sparse or (not transcript_has_steps))
+    if need_transcription and force_transcribe and not attempted_openai_transcribe:
+        audio_path, audio_err = download_video_audio_with_ytdlp(final_url)
+        if audio_path:
+            transcript_text, transcript_err = transcribe_audio_with_openai(audio_path)
+            try:
+                Path(audio_path).unlink(missing_ok=True)
+                Path(audio_path).parent.rmdir()
+            except Exception:
+                pass
+        else:
+            transcript_err = audio_err
+    elif need_transcription and is_fast_mode_enabled() and not force_transcribe and not transcript_err:
+        transcript_err = "fast mode skipped audio transcription"
 
     if transcript_text:
         if len(transcript_text) > VIDEO_TEXT_MAX_CHARS:
@@ -1216,6 +1389,23 @@ def is_detailed_video_description(text: str) -> bool:
         return True
     line_count = len([x for x in clean.splitlines() if normalize_space(x)])
     return line_count >= 10
+
+
+def description_has_method_detail(text: str) -> bool:
+    clean = normalize_multiline_text(decode_html_text(text))
+    if not clean:
+        return False
+    _, steps = extract_recipe_sections_from_text_blob(clean)
+    if has_meaningful_method_steps(steps):
+        return True
+    timestamp_like = 0
+    for raw in clean.splitlines():
+        line = normalize_space(raw)
+        if re.match(r"^\d{1,2}:\d{2}(?::\d{2})?\b", line):
+            timestamp_like += 1
+            if timestamp_like >= 3:
+                return True
+    return False
 
 
 def canonical_reply_locale(locale: str) -> str:
@@ -3645,9 +3835,9 @@ def fetch_video_metadata_with_ytdlp(url: str) -> Tuple[Dict[str, Any], str]:
         return {}, f"yt-dlp metadata parse failed ({exc.__class__.__name__}: {exc})"
 
 
-def select_caption_track_url(tracks: Any, preferred_lang: str = "") -> str:
+def select_caption_track_urls(tracks: Any, preferred_lang: str = "", limit: int = 12) -> List[str]:
     if not isinstance(tracks, dict):
-        return ""
+        return []
     preferred_tokens = [preferred_lang.casefold()] if preferred_lang else []
     preferred_tokens.extend(["zh-hant", "zh-hans", "zh", "yue", "ja", "ko", "en"])
     scored: List[Tuple[int, str]] = []
@@ -3672,11 +3862,26 @@ def select_caption_track_url(tracks: Any, preferred_lang: str = "") -> str:
                 ext_score = 30
             elif ext in {"srv3", "srv2", "ttml", "srt"}:
                 ext_score = 20
-            scored.append((lang_score + ext_score, u))
+            translit_penalty = -8 if "tlang=" in u else 0
+            scored.append((lang_score + ext_score + translit_penalty, u))
     if not scored:
-        return ""
+        return []
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
+    urls: List[str] = []
+    seen: set = set()
+    for _, u in scored:
+        if u in seen:
+            continue
+        seen.add(u)
+        urls.append(u)
+        if len(urls) >= max(1, int(limit or 1)):
+            break
+    return urls
+
+
+def select_caption_track_url(tracks: Any, preferred_lang: str = "") -> str:
+    urls = select_caption_track_urls(tracks, preferred_lang=preferred_lang, limit=1)
+    return urls[0] if urls else ""
 
 
 def parse_caption_text(raw: str) -> str:
@@ -3728,6 +3933,104 @@ def fetch_caption_text(caption_url: str) -> Tuple[str, str]:
     if len(parsed) > TRANSCRIPT_MAX_CHARS:
         parsed = parsed[:TRANSCRIPT_MAX_CHARS].rstrip() + "..."
     return parsed, ""
+
+
+def fetch_caption_text_with_ytdlp(video_url: str, preferred_lang: str = "") -> Tuple[str, str]:
+    ytdlp = find_ytdlp_binary()
+    if not ytdlp:
+        return "", "yt-dlp not installed"
+    tmp_dir = tempfile.mkdtemp(prefix="chief_fafa_subs_")
+    out_tmpl = str(Path(tmp_dir) / "video.%(id)s.%(ext)s")
+    lang_tokens: List[str] = []
+    if preferred_lang:
+        lang_tokens.append(preferred_lang)
+    lang_tokens.extend(["zh-Hant", "zh-Hans", "zh", "yue", "ja", "ko", "en.*", "en"])
+    seen_langs: set = set()
+    sub_langs: List[str] = []
+    for tok in lang_tokens:
+        key = tok.casefold().strip()
+        if not key or key in seen_langs:
+            continue
+        seen_langs.add(key)
+        sub_langs.append(tok)
+
+    cmd = [
+        ytdlp,
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-format",
+        "vtt",
+        "--sub-langs",
+        ",".join(sub_langs),
+        "-o",
+        out_tmpl,
+        video_url,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240, check=False)
+    except Exception as exc:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return "", f"yt-dlp subtitle fetch failed ({exc.__class__.__name__}: {exc})"
+    if proc.returncode != 0:
+        err = normalize_space(proc.stderr or proc.stdout or "")
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return "", f"yt-dlp subtitle error: {err[:320] or 'unknown'}"
+
+    files = sorted(Path(tmp_dir).glob("*.vtt"))
+    if not files:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return "", "yt-dlp subtitle files not found"
+
+    preferred = [x.casefold() for x in sub_langs]
+    scored: List[Tuple[int, Path]] = []
+    for f in files:
+        name_low = f.name.casefold()
+        lang_score = 0
+        for idx, token in enumerate(preferred):
+            token_norm = token.replace(".*", "")
+            if token_norm and f".{token_norm.casefold()}." in name_low:
+                lang_score = max(lang_score, 200 - idx)
+                break
+        try:
+            size = int(f.stat().st_size)
+        except OSError:
+            size = 0
+        scored.append((lang_score + min(size // 1024, 120), f))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    last_err = ""
+    for _, f in scored[:8]:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            last_err = f"subtitle read failed ({exc.__class__.__name__}: {exc})"
+            continue
+        parsed = parse_caption_text(raw)
+        if parsed:
+            if len(parsed) > TRANSCRIPT_MAX_CHARS:
+                parsed = parsed[:TRANSCRIPT_MAX_CHARS].rstrip() + "..."
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return parsed, ""
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+    return "", last_err or "yt-dlp subtitle parsing yielded empty text"
 
 
 def pick_audio_downloaded_file(tmp_dir: str) -> str:
@@ -3958,12 +4261,12 @@ def parse_json_object_from_text(text: str) -> Dict[str, Any]:
         return {}
 
 
-def call_openai_responses_json(system_prompt: str, user_prompt: str) -> Tuple[Dict[str, Any], str]:
+def call_openai_responses_json(system_prompt: str, user_prompt: str, model_override: str = "") -> Tuple[Dict[str, Any], str]:
     api_key = read_env_value("OPENAI_API_KEY", "")
     if not api_key:
         return {}, "OPENAI_API_KEY missing"
 
-    model = read_env_value("CHIEF_FAFA_MODEL", "gpt-5-nano")
+    model = (model_override or "").strip() or read_env_value("CHIEF_FAFA_MODEL", "gpt-5-nano")
     req_payload = {
         "model": model,
         "input": [
@@ -4026,6 +4329,147 @@ def list_from_any(value: Any, max_items: int) -> List[str]:
     return unique_clean_lines(items, max_items=max_items)
 
 
+def chunk_text_for_map_reduce(text: str, chunk_chars: int = 3500, overlap_chars: int = 350) -> List[str]:
+    clean = normalize_multiline_text(decode_html_text(text))
+    if not clean:
+        return []
+    chunk_chars = max(1200, int(chunk_chars or 3500))
+    overlap_chars = max(0, min(int(overlap_chars or 350), chunk_chars // 3))
+    if len(clean) <= chunk_chars:
+        return [clean]
+
+    chunks: List[str] = []
+    start = 0
+    n = len(clean)
+    while start < n:
+        end = min(n, start + chunk_chars)
+        if end < n:
+            window = clean[start:end]
+            cut = max(
+                window.rfind("\n\n"),
+                window.rfind("\n"),
+                window.rfind("。"),
+                window.rfind("！"),
+                window.rfind("？"),
+                window.rfind(". "),
+                window.rfind("! "),
+                window.rfind("? "),
+            )
+            if cut > int(chunk_chars * 0.55):
+                end = start + cut + 1
+        if end <= start:
+            end = min(n, start + chunk_chars)
+        chunk = clean[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        start = max(0, end - overlap_chars)
+    return chunks
+
+
+def summarize_video_transcript_map_reduce(
+    title: str,
+    video_description: str,
+    video_transcript: str,
+    language_hint: str,
+) -> Tuple[Dict[str, Any], str]:
+    transcript = normalize_multiline_text(video_transcript)
+    if len(transcript) < 60:
+        return {}, "transcript too short for map-reduce summary"
+
+    summary_model = read_env_value("CHIEF_FAFA_SUMMARY_MODEL", SUMMARY_MODEL).strip() or SUMMARY_MODEL
+    chunk_chars = int(read_env_value("CHIEF_FAFA_SUMMARY_CHUNK_CHARS", "3500") or "3500")
+    chunk_overlap = int(read_env_value("CHIEF_FAFA_SUMMARY_CHUNK_OVERLAP", "350") or "350")
+    max_chunks = int(read_env_value("CHIEF_FAFA_SUMMARY_MAX_CHUNKS", "12") or "12")
+    chunks = chunk_text_for_map_reduce(transcript, chunk_chars=chunk_chars, overlap_chars=chunk_overlap)
+    if not chunks:
+        return {}, "transcript chunking produced no chunks"
+    if len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks]
+
+    map_system = (
+        "You summarize a recipe video transcript chunk in its original language. "
+        "Return strict JSON with keys: "
+        "key_points (array, 5-10 bullets), "
+        "steps (array of process/method steps), "
+        "numbers_ingredients_tools (array of numeric details, ingredients, tools), "
+        "tldr (string, 1-2 sentences)."
+    )
+    map_items: List[Dict[str, Any]] = []
+    map_errors: List[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        map_user = (
+            f"Language hint: {language_hint or 'unknown'}\n"
+            f"Video title: {title}\n"
+            f"Chunk {idx}/{len(chunks)}\n\n"
+            "Transcript chunk:\n"
+            + chunk[:18000]
+        )
+        parsed, err = call_openai_responses_json(map_system, map_user, model_override=summary_model)
+        if err:
+            map_errors.append(f"chunk {idx}: {err}")
+            continue
+        item = {
+            "chunk_index": idx,
+            "key_points": list_from_any(parsed.get("key_points", []), max_items=12),
+            "steps": list_from_any(parsed.get("steps", []), max_items=24),
+            "numbers_ingredients_tools": list_from_any(parsed.get("numbers_ingredients_tools", []), max_items=24),
+            "tldr": normalize_space(str(parsed.get("tldr", ""))),
+        }
+        map_items.append(item)
+
+    if not map_items:
+        return {}, "; ".join(map_errors[:2]) or "map summarization failed"
+
+    reduce_system = (
+        "You consolidate chunk-level recipe summaries in the source language. "
+        "Return strict JSON with keys: "
+        "final_summary (string), "
+        "chapter_outline (array), "
+        "consolidated_steps (array), "
+        "consolidated_ingredients (array), "
+        "tldr (string). "
+        "Keep actionable cooking content and avoid social/promotional lines."
+    )
+    reduce_payload = {
+        "language_hint": language_hint or "unknown",
+        "video_title": title,
+        "video_description": video_description[:2200],
+        "map_chunks": map_items,
+    }
+    reduce_user = "Merge these map outputs into final structured summary JSON only:\n" + json.dumps(
+        reduce_payload,
+        ensure_ascii=True,
+    )
+    reduced, reduce_err = call_openai_responses_json(reduce_system, reduce_user, model_override=summary_model)
+    if reduce_err:
+        fallback_steps = unique_clean_lines(
+            [s for item in map_items for s in item.get("steps", []) if str(s).strip()],
+            max_items=120,
+        )
+        fallback_numbers = unique_clean_lines(
+            [s for item in map_items for s in item.get("numbers_ingredients_tools", []) if str(s).strip()],
+            max_items=160,
+        )
+        fallback_tldr = normalize_space(" ".join([str(item.get("tldr", "")).strip() for item in map_items if str(item.get("tldr", "")).strip()]))
+        return {
+            "final_summary": fallback_tldr[:2000],
+            "chapter_outline": [],
+            "consolidated_steps": fallback_steps,
+            "consolidated_ingredients": fallback_numbers,
+            "tldr": fallback_tldr[:600],
+        }, ""
+
+    return {
+        "final_summary": decode_html_text(str(reduced.get("final_summary", "")).strip()),
+        "chapter_outline": list_from_any(reduced.get("chapter_outline", []), max_items=60),
+        "consolidated_steps": list_from_any(reduced.get("consolidated_steps", []), max_items=220),
+        "consolidated_ingredients": list_from_any(reduced.get("consolidated_ingredients", []), max_items=240),
+        "tldr": decode_html_text(str(reduced.get("tldr", "")).strip()),
+    }, ""
+
+
 def extract_text_recipe_with_openai(raw_text: str, language_hint: str) -> Tuple[Dict[str, Any], str]:
     clean_text = raw_text.strip()
     if not clean_text:
@@ -4060,6 +4504,115 @@ def extract_text_recipe_with_openai(raw_text: str, language_hint: str) -> Tuple[
         "language": decode_html_text(str(parsed.get("language", "")).strip().lower()),
         "ingredients": ingredients,
         "steps": steps,
+    }
+    return out, ""
+
+
+def extract_video_recipe_with_openai(
+    source_url: str,
+    title: str,
+    video_description: str,
+    video_transcript: str,
+    language_hint: str,
+) -> Tuple[Dict[str, Any], str]:
+    if not read_env_value("OPENAI_API_KEY", ""):
+        return {}, "OPENAI_API_KEY missing"
+
+    map_reduce_pack: Dict[str, Any] = {}
+    map_reduce_err = ""
+    if video_transcript.strip():
+        map_reduce_pack, map_reduce_err = summarize_video_transcript_map_reduce(
+            title=title,
+            video_description=video_description,
+            video_transcript=video_transcript,
+            language_hint=language_hint,
+        )
+
+    content_blob_parts: List[str] = []
+    if title.strip():
+        content_blob_parts.append(f"Video title:\n{title.strip()}")
+    if video_description.strip():
+        content_blob_parts.append(f"Video description:\n{video_description.strip()}")
+    if map_reduce_pack:
+        if str(map_reduce_pack.get("final_summary", "")).strip():
+            content_blob_parts.append(
+                "Map-reduce summary:\n" + str(map_reduce_pack.get("final_summary", "")).strip()
+            )
+        chapter_outline = list_from_any(map_reduce_pack.get("chapter_outline", []), max_items=60)
+        if chapter_outline:
+            content_blob_parts.append("Chapter outline:\n" + "\n".join(f"- {x}" for x in chapter_outline))
+        reduced_steps = list_from_any(map_reduce_pack.get("consolidated_steps", []), max_items=140)
+        if reduced_steps:
+            content_blob_parts.append("Reduced steps:\n" + "\n".join(f"- {x}" for x in reduced_steps))
+        reduced_ingredients = list_from_any(map_reduce_pack.get("consolidated_ingredients", []), max_items=140)
+        if reduced_ingredients:
+            content_blob_parts.append("Reduced ingredients/tools:\n" + "\n".join(f"- {x}" for x in reduced_ingredients))
+    if video_transcript.strip():
+        content_blob_parts.append(f"Video transcript:\n{video_transcript.strip()}")
+    content_blob = "\n\n".join(content_blob_parts).strip()
+    if len(content_blob) < 40:
+        return {}, "video content too short for OpenAI extraction"
+
+    system_prompt = (
+        "You extract structured recipe data from video metadata/transcript in ANY language. "
+        "Prefer the dominant source language indicated by language_hint; avoid unnecessary language switching. "
+        "Do not translate unless the source itself is clearly bilingual. Preserve original wording and units. "
+        "Return strict JSON object with keys: title (string), description (string), "
+        "ingredients (array of strings), steps (array of strings). "
+        "Only include ingredients/steps supported by the provided text. "
+        "If steps are implied by narration, convert them into concise imperative cooking steps."
+    )
+    user_prompt = (
+        "Extract recipe details from this video source context and return JSON only.\n"
+        f"Source URL: {source_url}\n"
+        f"Language hint: {language_hint or 'unknown'}\n\n"
+        "Context:\n"
+        + content_blob[:20000]
+    )
+    extract_model = read_env_value("CHIEF_FAFA_VIDEO_EXTRACT_MODEL", "")
+    parsed, err = call_openai_responses_json(system_prompt, user_prompt, model_override=extract_model)
+    if err:
+        fallback_steps = list_from_any(map_reduce_pack.get("consolidated_steps", []), max_items=360) if map_reduce_pack else []
+        fallback_ings = list_from_any(map_reduce_pack.get("consolidated_ingredients", []), max_items=320) if map_reduce_pack else []
+        fallback_desc = (
+            str(map_reduce_pack.get("tldr", "")).strip()
+            or str(map_reduce_pack.get("final_summary", "")).strip()
+            if map_reduce_pack
+            else ""
+        )
+        if fallback_steps or fallback_ings or fallback_desc:
+            return {
+                "title": cleanup_title_text(title),
+                "description": decode_html_text(fallback_desc),
+                "ingredients": unique_clean_lines(fallback_ings, max_items=320),
+                "steps": unique_clean_lines(fallback_steps, max_items=360),
+            }, ""
+        if map_reduce_err:
+            return {}, f"{err} | map-reduce: {map_reduce_err}"
+        return {}, err
+
+    ingredients = list_from_any(parsed.get("ingredients", []), max_items=320)
+    steps = list_from_any(parsed.get("steps", []), max_items=360)
+    if not steps:
+        steps = list_from_any(parsed.get("method", []), max_items=360)
+    if not steps:
+        steps = list_from_any(parsed.get("instructions", []), max_items=360)
+
+    if map_reduce_pack:
+        mr_ings = list_from_any(map_reduce_pack.get("consolidated_ingredients", []), max_items=320)
+        mr_steps = list_from_any(map_reduce_pack.get("consolidated_steps", []), max_items=360)
+        ingredients = unique_clean_lines(list(ingredients) + list(mr_ings), max_items=320)
+        steps = unique_clean_lines(list(steps) + list(mr_steps), max_items=360)
+
+    out = {
+        "title": cleanup_title_text(str(parsed.get("title", "")).strip()),
+        "description": decode_html_text(
+            str(parsed.get("description", "")).strip()
+            or str(map_reduce_pack.get("tldr", "")).strip()
+            or str(map_reduce_pack.get("final_summary", "")).strip()
+        ),
+        "ingredients": unique_clean_lines(ingredients, max_items=320),
+        "steps": unique_clean_lines(steps, max_items=360),
     }
     return out, ""
 
@@ -5159,6 +5712,81 @@ def format_duplicate_markdown_report(hit: Dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def chief_fafa_memory_root() -> Path:
+    return Path(read_env_value("CHIEF_FAFA_MEMORY_ROOT", "/home/felixlee/Desktop/chief-fafa")).expanduser()
+
+
+def append_chief_fafa_session_memory_note(lines: Sequence[str], memory_root: Optional[Path] = None) -> str:
+    try:
+        root = (memory_root or chief_fafa_memory_root()).expanduser()
+        memory_dir = root / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        local_day = dt.datetime.now().astimezone().date().isoformat()
+        daily_path = memory_dir / f"{local_day}.md"
+
+        cleaned = [normalize_space(str(x)) for x in lines if normalize_space(str(x))]
+        if not cleaned:
+            return ""
+
+        if daily_path.exists():
+            base = daily_path.read_text(encoding="utf-8", errors="ignore").rstrip() + "\n\n"
+        else:
+            base = f"# Memory Log - {local_day}\n\n"
+
+        daily_path.write_text(base + "\n".join(cleaned) + "\n", encoding="utf-8")
+        return str(daily_path)
+    except Exception:
+        return ""
+
+
+def record_memory_for_enquiry(lookup: Dict[str, Any], report_path: Path) -> None:
+    now_text = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    query = normalize_space(str(lookup.get("query", ""))) or "(empty query)"
+    summary = normalize_space(str(lookup.get("summary", "")))
+    doc_status = normalize_space(str(lookup.get("google_doc_status", "not_found")))
+    doc_url = normalize_space(str(lookup.get("google_doc_url", "")))
+    error_message = normalize_space(str(lookup.get("error_message", "")))
+    lines = [
+        f"- [{now_text}] enquiry: {query}",
+        f"  summary: {summary}",
+        f"  doc_status: {doc_status}",
+        f"  doc_url: {doc_url or '(none)'}",
+        f"  report_path: {report_path}",
+    ]
+    if error_message:
+        lines.append(f"  note: {error_message}")
+    record_path = append_chief_fafa_session_memory_note(lines)
+    if record_path:
+        lookup["memory_note_path"] = record_path
+
+
+def record_memory_for_recipe(source: Dict[str, Any], note_result: Dict[str, Any], report_path: Path, mode_label: str = "run") -> None:
+    now_text = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    title = normalize_space(decode_html_text(str(source.get("title", "")))) or "Untitled"
+    source_url = normalize_space(str(source.get("url", "")))
+    content_type = normalize_space(str(source.get("content_type", ""))) or "unknown"
+    doc_url = normalize_space(str(note_result.get("url", "")))
+    note_message = normalize_space(str(note_result.get("message", "")))
+
+    doc_status = "ok" if bool(note_result.get("ok")) else "failed"
+    if "already exists" in note_message.casefold():
+        doc_status = "exists"
+    elif note_message.casefold().startswith("skipped"):
+        doc_status = "skipped"
+
+    lines = [
+        f"- [{now_text}] {mode_label}: {title}",
+        f"  source_type: {content_type}",
+        f"  source_url: {source_url or '(text input)'}",
+        f"  doc_status: {doc_status}",
+        f"  doc_url: {doc_url or '(none)'}",
+        f"  report_path: {report_path}",
+    ]
+    if note_message:
+        lines.append(f"  note: {note_message}")
+    append_chief_fafa_session_memory_note(lines)
+
+
 def extract_source_payload(url: str) -> Dict[str, Any]:
     final_url, html = fetch_page(url)
     domain = urlparse(final_url).netloc.lower()
@@ -5208,8 +5836,11 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
             video_chapter_steps = extract_youtube_chapter_steps_from_html(html, max_items=80)
 
         has_rich_description = has_meaningful_text(video_description, min_chars=40)
+        description_has_steps = description_has_method_detail(video_description)
         steps_need_help = not has_meaningful_method_steps(all_steps)
-        need_enrichment = (not (fast_mode and is_youtube_source and has_rich_description)) or steps_need_help
+        need_enrichment = (
+            not (fast_mode and is_youtube_source and has_rich_description and description_has_steps)
+        ) or steps_need_help
         if need_enrichment:
             enriched = extract_video_text_sources(final_url, video_description)
             video_description = first_non_empty([enriched.get("description", ""), video_description])
@@ -5230,22 +5861,65 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
                     image_url,
                 ]
             )
+
+        openai_video_extract_err = ""
+        if env_flag("CHIEF_FAFA_VIDEO_OPENAI_EXTRACT_FIRST", True) and (video_description or video_transcript):
+            language_hint = dominant_script_group("\n".join([title, video_description, video_transcript]))
+            ai_video, ai_video_err = extract_video_recipe_with_openai(
+                source_url=final_url,
+                title=title,
+                video_description=video_description,
+                video_transcript=video_transcript,
+                language_hint=language_hint,
+            )
+            if ai_video:
+                ai_ingredients = unique_clean_lines([str(x) for x in ai_video.get("ingredients", [])], max_items=260)
+                ai_steps_raw = unique_clean_lines([str(x) for x in ai_video.get("steps", [])], max_items=320)
+                ai_steps = extract_method_like_steps_from_free_text("\n".join(ai_steps_raw), max_items=320) or ai_steps_raw
+                ai_steps = filter_instruction_like_steps(ai_steps, min_keep=3, max_items=320)
+                if ai_ingredients:
+                    all_ingredients = unique_clean_lines(ai_ingredients + list(all_ingredients), max_items=260)
+                if ai_steps:
+                    all_steps = unique_clean_lines(ai_steps + list(all_steps), max_items=320)
+                ai_title = cleanup_title_text(str(ai_video.get("title", "")).strip())
+                if ai_title and (not title or title_looks_generic(title)):
+                    title = ai_title
+                ai_desc = decode_html_text(str(ai_video.get("description", "")).strip())
+                if ai_desc and not has_meaningful_text(video_description, min_chars=28):
+                    video_description = ai_desc
+            elif ai_video_err:
+                openai_video_extract_err = ai_video_err
+
         # Prefer extraction from description; only use transcript as fallback when missing.
         desc_ingredients, desc_steps = extract_recipe_sections_from_text_blob(video_description)
+        desc_steps_meaningful = has_meaningful_method_steps(desc_steps)
         all_ingredients = unique_clean_lines(list(all_ingredients) + desc_ingredients, max_items=260)
         all_steps = unique_clean_lines(list(all_steps) + desc_steps, max_items=320)
         steps_meaningful = has_meaningful_method_steps(all_steps)
-        if (not all_ingredients or not steps_meaningful) and video_transcript:
+        if video_transcript and (not all_ingredients or not steps_meaningful or not desc_steps_meaningful):
             transcript_ingredients, transcript_steps = extract_recipe_sections_from_text_blob(video_transcript)
+            transcript_steps_meaningful = has_meaningful_method_steps(transcript_steps)
             if not all_ingredients:
                 all_ingredients = unique_clean_lines(list(all_ingredients) + transcript_ingredients, max_items=260)
-            if not steps_meaningful and transcript_steps:
+            if (not desc_steps_meaningful) and transcript_steps_meaningful:
+                all_steps = unique_clean_lines(transcript_steps, max_items=320)
+                steps_meaningful = True
+            elif not steps_meaningful and transcript_steps:
                 all_steps = unique_clean_lines(transcript_steps, max_items=320)
                 steps_meaningful = has_meaningful_method_steps(all_steps)
+            if not steps_meaningful:
+                synthesized_steps = extract_method_like_steps_from_free_text(video_transcript, max_items=80)
+                if synthesized_steps:
+                    all_steps = unique_clean_lines(synthesized_steps, max_items=320)
+                    steps_meaningful = has_meaningful_method_steps(all_steps)
         if video_chapter_steps and not has_meaningful_method_steps(all_steps):
             all_steps = unique_clean_lines(video_chapter_steps, max_items=320)
         if not has_meaningful_method_steps(all_steps) and not video_chapter_steps:
-            all_steps = []
+            synthesized_steps = extract_method_like_steps_from_free_text(video_transcript, max_items=32) if video_transcript else []
+            all_steps = unique_clean_lines(synthesized_steps, max_items=320) if synthesized_steps else []
+        all_steps = filter_instruction_like_steps(all_steps, min_keep=3, max_items=320)
+        if openai_video_extract_err and not video_note:
+            video_note = f"OpenAI video extraction unavailable: {openai_video_extract_err}"
         video_blob = "\n\n".join([video_description, video_transcript]).strip()
         if not text_excerpt and video_blob:
             text_excerpt = video_blob[:2400]
@@ -5422,6 +6096,7 @@ def main() -> None:
         report_path = output_dir / f"{stamp}-{slug}.md"
         report_markdown = format_enquiry_markdown_report(lookup)
         report_path.write_text(report_markdown, encoding="utf-8")
+        record_memory_for_enquiry(lookup, report_path=report_path)
 
         lookup_result = {
             "ok": bool(lookup.get("ok", True)),
@@ -5485,6 +6160,20 @@ def main() -> None:
             report_path = output_dir / f"{stamp}-{slug}.md"
             report_markdown = format_duplicate_markdown_report(initial_dup)
             report_path.write_text(report_markdown, encoding="utf-8")
+            record_memory_for_recipe(
+                {
+                    "title": str(initial_dup.get("title", "Recipe")),
+                    "url": str(initial_dup.get("source_url", initial_input_url or "")),
+                    "content_type": "duplicate",
+                },
+                {
+                    "ok": True,
+                    "url": str(initial_dup.get("doc_url", "")).strip(),
+                    "message": "already exists; skipped duplicate creation",
+                },
+                report_path=report_path,
+                mode_label="duplicate_hit",
+            )
 
             duplicate_summary = localized_duplicate_summary(
                 title=decode_html_text(str(initial_dup.get("title", "Recipe"))),
@@ -5592,6 +6281,7 @@ def main() -> None:
                 report_path = output_dir / f"{stamp}-{slug}.md"
                 report_markdown = format_enquiry_markdown_report(lookup)
                 report_path.write_text(report_markdown, encoding="utf-8")
+                record_memory_for_enquiry(lookup, report_path=report_path)
                 if args.json:
                     if args.json_brief:
                         summary = str(lookup.get("summary", "")).strip()
@@ -5702,6 +6392,7 @@ def main() -> None:
     slug = slugify(str(source.get("title", "recipe")))
     report_path = output_dir / f"{stamp}-{slug}.md"
     report_path.write_text(report_markdown, encoding="utf-8")
+    record_memory_for_recipe(source, note_result, report_path=report_path, mode_label="run")
 
     result = {
         "ok": True,
