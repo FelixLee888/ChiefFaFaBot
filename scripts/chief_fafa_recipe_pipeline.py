@@ -1095,6 +1095,7 @@ def normalize_title_for_chat(text: str) -> str:
             if len(left) >= 10:
                 title = left
                 break
+    title = short_recipe_title(title)
     if len(title) > 120:
         title = title[:117].rstrip() + "..."
     return title
@@ -1171,6 +1172,173 @@ def cleanup_title_text(text: str) -> str:
     title = re.sub(r"\s{2,}", " ", title).strip()
     title = re.sub(r"[:：|/·\-\u2014]+$", "", title).strip()
     return title
+
+
+TITLE_PROMO_PATTERNS = [
+    r"这是我一直在用的",
+    r"這是我一直在用的",
+    r"这是我常用的",
+    r"這是我常用的",
+    r"按着做",
+    r"按著做",
+    r"新手也能",
+    r"超详细",
+    r"超詳細",
+    r"零失败",
+    r"零失敗",
+    r"你一定",
+    r"惊喜",
+    r"驚喜",
+    r"只需要",
+    r"每个步骤",
+    r"每個步驟",
+    r"水光肌",
+    r"詳細",
+    r"详细",
+]
+
+TITLE_STOP_MARKERS = [
+    "配方:",
+    "配方：",
+    "材料:",
+    "材料：",
+    "食材:",
+    "食材：",
+    "做法:",
+    "做法：",
+    "步骤:",
+    "步骤：",
+    "步驟:",
+    "步驟：",
+    "ingredients:",
+    "ingredients：",
+    "ingredient:",
+    "method:",
+    "steps:",
+    "directions:",
+    "recipe:",
+]
+
+CJK_DISH_NAME_RE = re.compile(
+    r"([\u3400-\u9fffA-Za-z0-9]{1,24}(?:蛋糕|麵包|面包|吐司|餅|饼|派|塔|布丁|蛋撻|蛋挞|湯|汤|粥|飯|饭|麵|面|粉|鍋|锅|雞|鸡|牛肉|豬|猪|蝦|虾|魚|鱼|沙拉|壽司|寿司|拉麵|拉面|義大利麵|意大利面|炒飯|炒饭|炒麵|炒面|燉飯|炖饭|煲|卷|餃子|饺子|包子|糕))",
+    flags=re.IGNORECASE,
+)
+
+LATIN_DISH_NAME_RE = re.compile(
+    r"([A-Za-z][A-Za-z'\- ]{1,48}(?:cake|bread|cookie|cookies|soup|stew|pasta|noodles?|dumplings?|omelette|pizza|salad|curry|sandwich|tart|pie|risotto|pancakes?|brownies?))",
+    flags=re.IGNORECASE,
+)
+
+
+def _trim_title_wrappers(text: str) -> str:
+    out = text.strip()
+    changed = True
+    while changed and len(out) >= 2:
+        changed = False
+        pairs = [
+            ("【", "】"),
+            ("[", "]"),
+            ("(", ")"),
+            ("（", "）"),
+            ("「", "」"),
+            ("『", "』"),
+        ]
+        for left, right in pairs:
+            if out.startswith(left) and out.endswith(right):
+                out = out[len(left) : -len(right)].strip()
+                changed = True
+                break
+    return out
+
+
+def _de_promote_title_candidate(text: str) -> str:
+    out = cleanup_title_text(text)
+    out = _trim_title_wrappers(out)
+    for marker in TITLE_STOP_MARKERS:
+        idx = out.casefold().find(marker.casefold())
+        if idx > 0:
+            out = out[:idx].strip()
+    out = re.split(r"[。！？!?\n]", out, maxsplit=1)[0].strip()
+    for pat in TITLE_PROMO_PATTERNS:
+        out = re.sub(pat, "", out, flags=re.IGNORECASE).strip()
+    out = re.sub(r"^(?:这是我|這是我|一直在用的|常用的|教你|分享|只需|只需要)+", "", out).strip()
+    out = re.sub(
+        r"(?:配方|食谱|食譜|做法|教程|教學|教学|完整版|視頻|视频|影片|recipe|reel|video)$",
+        "",
+        out,
+        flags=re.IGNORECASE,
+    ).strip()
+    out = cleanup_title_text(out)
+    out = out.strip("-—:：;；,，.。!！?？ ")
+    return normalize_space(out)
+
+
+def _extract_dish_like_name(text: str) -> str:
+    t = _de_promote_title_candidate(text)
+    if not t:
+        return ""
+    m = CJK_DISH_NAME_RE.search(t)
+    if m:
+        dish = normalize_space(m.group(1))
+        dish = re.sub(r"^(?:这是我一直在用的|這是我一直在用的|这是我常用的|這是我常用的|这是我|這是我|一直在用的|常用的)", "", dish).strip()
+        dish = re.sub(r"(?:配方|食谱|食譜)$", "", dish).strip()
+        return cleanup_title_text(dish)
+    m = LATIN_DISH_NAME_RE.search(t)
+    if m:
+        return cleanup_title_text(m.group(1))
+    return t
+
+
+def short_recipe_title(title: str, fallback_text: str = "") -> str:
+    base = cleanup_title_text(title)
+    candidates: List[str] = []
+    if base:
+        candidates.append(base)
+        for x in re.findall(r"[【\[(（「『]([^】\])）」。\n]{2,100})[】\])）」』]", base):
+            c = normalize_space(x)
+            if c:
+                candidates.append(c)
+        for x in re.split(r"[，,、；;|｜/／·•]", base):
+            c = normalize_space(x)
+            if c:
+                candidates.append(c)
+    if fallback_text:
+        for line in normalize_multiline_text(fallback_text).splitlines()[:5]:
+            c = normalize_space(line)
+            if c:
+                candidates.append(c)
+
+    best = ""
+    best_score = -10**9
+    for raw in candidates:
+        candidate = _extract_dish_like_name(raw)
+        if not candidate:
+            continue
+        if len(candidate) < 2:
+            continue
+        if len(candidate) > 48:
+            continue
+        score = 0
+        if CJK_DISH_NAME_RE.search(candidate) or LATIN_DISH_NAME_RE.search(candidate):
+            score += 120
+        if len(candidate) <= 20:
+            score += 18
+        elif len(candidate) <= 28:
+            score += 10
+        elif len(candidate) <= 36:
+            score += 4
+        for pat in TITLE_PROMO_PATTERNS:
+            if re.search(pat, candidate, flags=re.IGNORECASE):
+                score -= 30
+        if score > best_score:
+            best = candidate
+            best_score = score
+
+    out = best or _de_promote_title_candidate(base) or base
+    out = cleanup_title_text(out)
+    if len(out) > 64:
+        out = out[:61].rstrip() + "..."
+    return out
 
 
 def title_looks_generic(title: str) -> bool:
@@ -5944,11 +6112,12 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
         fallback_title = derive_title_from_text("\n".join([video_description, video_transcript, description, text_excerpt]))
         if fallback_title:
             title = refine_title_for_content_language(fallback_title, context_text) or fallback_title
+    title = short_recipe_title(title, fallback_text=context_text)
 
     if "instagram.com" in domain and " on Instagram" in title:
         title = title.split(" on Instagram", 1)[0].strip()
-    if len(title) > 180:
-        title = title[:177].rstrip() + "..."
+    if len(title) > 80:
+        title = title[:77].rstrip() + "..."
     if len(description) > 800:
         description = description[:797].rstrip() + "..."
 
