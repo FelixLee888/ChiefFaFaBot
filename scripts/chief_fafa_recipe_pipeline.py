@@ -30,6 +30,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
 import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 REQUEST_TIMEOUT = 25
 OPENAI_REQUEST_TIMEOUT = 55
@@ -279,6 +281,7 @@ ENV_FALLBACK_FILES = [
     Path.home() / ".openclaw/.env",
     Path.home() / "Desktop/chief-fafa/.env",
 ]
+SERVICE_ACCOUNT_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}
 
 
 def read_env_value(name: str, default: str = "") -> str:
@@ -320,6 +323,152 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 def is_fast_mode_enabled() -> bool:
     return env_flag("CHIEF_FAFA_FAST_MODE", False)
+
+
+def jwt_b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def parse_google_folder_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"/folders/([A-Za-z0-9_-]+)", text)
+    if match:
+        return match.group(1).strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", text):
+        return text
+    return ""
+
+
+def load_service_account_payload(prefixes: Iterable[str]) -> Dict[str, str]:
+    candidates = [str(p or "").strip().upper() for p in prefixes if str(p or "").strip()]
+    json_keys: List[str] = []
+    file_keys: List[str] = []
+    email_keys: List[str] = []
+    private_key_keys: List[str] = []
+    for prefix in candidates:
+        json_keys.extend([f"{prefix}_SERVICE_ACCOUNT_JSON", f"{prefix}_JSON"])
+        file_keys.extend([f"{prefix}_SERVICE_ACCOUNT_JSON_FILE", f"{prefix}_JSON_FILE"])
+        email_keys.extend([f"{prefix}_SERVICE_ACCOUNT_EMAIL", f"{prefix}_CLIENT_EMAIL", "GOOGLE_CLIENT_EMAIL"])
+        private_key_keys.extend([f"{prefix}_SERVICE_ACCOUNT_PRIVATE_KEY", f"{prefix}_PRIVATE_KEY", "GOOGLE_PRIVATE_KEY"])
+
+    json_keys.extend(["GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON"])
+    file_keys.extend(["GOOGLE_SERVICE_ACCOUNT_JSON_FILE", "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_FILE"])
+    email_keys.extend(["GOOGLE_SERVICE_ACCOUNT_EMAIL", "GOOGLE_SHEETS_SERVICE_ACCOUNT_EMAIL"])
+    private_key_keys.extend(["GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "GOOGLE_SHEETS_SERVICE_ACCOUNT_PRIVATE_KEY"])
+
+    raw_json = ""
+    for key in json_keys:
+        raw_json = read_env_value(key, "").strip()
+        if raw_json:
+            break
+    if not raw_json:
+        for key in file_keys:
+            path_text = read_env_value(key, "").strip()
+            if not path_text:
+                continue
+            try:
+                raw_json = Path(path_text).read_text(encoding="utf-8")
+                break
+            except Exception:
+                continue
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            client_email = str(parsed.get("client_email", "")).strip()
+            private_key = str(parsed.get("private_key", "")).strip()
+            token_uri = str(parsed.get("token_uri", "")).strip() or GOOGLE_TOKEN_URL
+            project_id = str(parsed.get("project_id", "")).strip()
+            if client_email and private_key:
+                return {
+                    "client_email": client_email,
+                    "private_key": private_key,
+                    "token_uri": token_uri,
+                    "project_id": project_id,
+                }
+
+    client_email = ""
+    for key in email_keys:
+        client_email = read_env_value(key, "").strip()
+        if client_email:
+            break
+    private_key = ""
+    for key in private_key_keys:
+        private_key = read_env_value(key, "").strip()
+        if private_key:
+            break
+    private_key = private_key.replace("\\n", "\n").strip()
+    token_uri = read_env_value("GOOGLE_SERVICE_ACCOUNT_TOKEN_URI", GOOGLE_TOKEN_URL).strip() or GOOGLE_TOKEN_URL
+    project_id = read_env_value("GOOGLE_SERVICE_ACCOUNT_PROJECT_ID", "").strip()
+    if client_email and private_key:
+        return {
+            "client_email": client_email,
+            "private_key": private_key,
+            "token_uri": token_uri,
+            "project_id": project_id,
+        }
+    return {}
+
+
+def mint_service_account_access_token(prefixes: Iterable[str], scopes: Iterable[str]) -> Tuple[str, str]:
+    payload = load_service_account_payload(prefixes)
+    client_email = str(payload.get("client_email", "")).strip()
+    private_key_pem = str(payload.get("private_key", "")).strip()
+    token_uri = str(payload.get("token_uri", "")).strip() or GOOGLE_TOKEN_URL
+    scope_list = [str(s or "").strip() for s in scopes if str(s or "").strip()]
+    if not client_email or not private_key_pem or not scope_list:
+        return "", "service account credentials not configured"
+
+    cache_key = f"{client_email}|{' '.join(scope_list)}"
+    cached = SERVICE_ACCOUNT_TOKEN_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and cached[0] and cached[1] > now_ts + 60:
+        return cached[0], ""
+
+    try:
+        private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+    except Exception as exc:
+        return "", f"service account private key load failed ({exc.__class__.__name__}: {exc})"
+
+    issued_at = int(now_ts)
+    claim = {
+        "iss": client_email,
+        "scope": " ".join(scope_list),
+        "aud": token_uri,
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+    }
+    header = {"alg": "RS256", "typ": "JWT"}
+    encoded_header = jwt_b64url(json.dumps(header, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    encoded_claim = jwt_b64url(json.dumps(claim, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_claim}".encode("ascii")
+    try:
+        signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    except Exception as exc:
+        return "", f"service account signing failed ({exc.__class__.__name__}: {exc})"
+    assertion = f"{encoded_header}.{encoded_claim}.{jwt_b64url(signature)}"
+
+    token_payload = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": assertion,
+    }
+    try:
+        resp = requests.post(token_uri, data=token_payload, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return "", f"service account token mint failed ({exc.__class__.__name__}: {exc})"
+
+    access_token = str(data.get("access_token", "")).strip()
+    expires_in = int(data.get("expires_in", 3600) or 3600)
+    if not access_token:
+        return "", "service account token response missing access_token"
+    SERVICE_ACCOUNT_TOKEN_CACHE[cache_key] = (access_token, now_ts + max(300, expires_in))
+    return access_token, ""
 
 
 def normalize_space(text: str) -> str:
@@ -4916,7 +5065,19 @@ def resolve_google_client_secrets() -> Tuple[str, str]:
     return client_id, client_secret
 
 
-def resolve_docs_access_token() -> Tuple[str, str]:
+def resolve_docs_access_token(prefer_service_account: bool = True) -> Tuple[str, str]:
+    service_err = ""
+    if prefer_service_account:
+        service_token, service_err = mint_service_account_access_token(
+            prefixes=("GOOGLE_DOCS", "GOOGLE_DRIVE", "GOOGLE"),
+            scopes=(
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/drive",
+            ),
+        )
+        if service_token:
+            return service_token, ""
+
     refresh = read_env_value("GOOGLE_DOCS_REFRESH_TOKEN", read_env_value("GOOGLE_KEEP_REFRESH_TOKEN", ""))
     direct = read_env_value("GOOGLE_DOCS_ACCESS_TOKEN", read_env_value("GOOGLE_KEEP_ACCESS_TOKEN", ""))
 
@@ -4953,6 +5114,8 @@ def resolve_docs_access_token() -> Tuple[str, str]:
     if direct:
         return direct, ""
 
+    if prefer_service_account and service_err and "not configured" not in service_err.lower():
+        return "", service_err
     return "", "GOOGLE_DOCS_ACCESS_TOKEN / GOOGLE_DOCS_REFRESH_TOKEN not configured"
 
 
@@ -5170,6 +5333,112 @@ def resolve_image_source_for_embed(image_source: str) -> Tuple[bytes, str, str, 
     return b"", "", "", f"unsupported image source: {source}"
 
 
+def resolve_docs_folder_id() -> str:
+    for key in (
+        "GOOGLE_DOCS_FOLDER_ID",
+        "GOOGLE_DOCS_FOLDER_URL",
+        "GOOGLE_DRIVE_FOLDER_ID",
+        "GOOGLE_DRIVE_FOLDER_URL",
+    ):
+        folder_id = parse_google_folder_id(read_env_value(key, ""))
+        if folder_id:
+            return folder_id
+    return ""
+
+
+def move_google_drive_file_to_folder(
+    file_id: str,
+    access_token: str,
+    quota_project: str,
+    folder_id: str,
+) -> str:
+    clean_file_id = str(file_id or "").strip()
+    clean_folder_id = str(folder_id or "").strip()
+    if not clean_file_id or not clean_folder_id:
+        return ""
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if quota_project:
+        headers["X-Goog-User-Project"] = quota_project
+    params = {"fields": "parents", "supportsAllDrives": "true"}
+    try:
+        current_resp = requests.get(
+            f"{GOOGLE_DRIVE_API_BASE}/{clean_file_id}",
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        current_data = current_resp.json() if current_resp.text else {}
+    except Exception as exc:
+        return f"Drive parent lookup failed ({exc.__class__.__name__}: {exc})"
+    if current_resp.status_code >= 400:
+        detail = extract_google_api_error(current_data)
+        return f"Drive parent lookup HTTP {current_resp.status_code}: {detail or 'request failed'}"
+
+    parents = current_data.get("parents", []) if isinstance(current_data, dict) else []
+    if not isinstance(parents, list):
+        parents = []
+    remove_parents = ",".join(
+        str(parent).strip()
+        for parent in parents
+        if str(parent).strip() and str(parent).strip() != clean_folder_id
+    )
+    patch_params = {"addParents": clean_folder_id, "fields": "id,parents", "supportsAllDrives": "true"}
+    if remove_parents:
+        patch_params["removeParents"] = remove_parents
+    try:
+        patch_resp = requests.patch(
+            f"{GOOGLE_DRIVE_API_BASE}/{clean_file_id}",
+            headers=headers,
+            params=patch_params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        patch_data = patch_resp.json() if patch_resp.text else {}
+    except Exception as exc:
+        return f"Drive move failed ({exc.__class__.__name__}: {exc})"
+    if patch_resp.status_code >= 400:
+        detail = extract_google_api_error(patch_data)
+        return f"Drive move HTTP {patch_resp.status_code}: {detail or 'request failed'}"
+    return ""
+
+
+def create_google_doc_file_via_drive(
+    title: str,
+    access_token: str,
+    quota_project: str,
+    folder_id: str,
+) -> Tuple[str, str]:
+    clean_title = str(title or "").strip()[:200] or "Chief Fafa Recipe"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    if quota_project:
+        headers["X-Goog-User-Project"] = quota_project
+    payload: Dict[str, Any] = {
+        "name": clean_title,
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    if folder_id:
+        payload["parents"] = [folder_id]
+    params = {"fields": "id", "supportsAllDrives": "true"}
+    try:
+        resp = requests.post(
+            GOOGLE_DRIVE_API_BASE,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.text else {}
+    except Exception as exc:
+        return "", f"Drive document create failed ({exc.__class__.__name__}: {exc})"
+    if resp.status_code >= 400:
+        detail = extract_google_api_error(data)
+        return "", f"Drive document create HTTP {resp.status_code}: {detail or 'request failed'}"
+    document_id = str(data.get("id", "")).strip() if isinstance(data, dict) else ""
+    if not document_id:
+        return "", "Drive document create response missing id"
+    return document_id, ""
+
+
 def insert_image_with_uri_candidates(
     document_id: str,
     access_token: str,
@@ -5274,7 +5543,11 @@ def upload_image_to_drive_for_embed(
     filename: str,
 ) -> Tuple[str, str]:
     boundary = f"==============={int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)}=="
-    metadata = json.dumps({"name": filename, "mimeType": mime_type}, ensure_ascii=True).encode("utf-8")
+    metadata_obj: Dict[str, Any] = {"name": filename, "mimeType": mime_type}
+    folder_id = resolve_docs_folder_id()
+    if folder_id:
+        metadata_obj["parents"] = [folder_id]
+    metadata = json.dumps(metadata_obj, ensure_ascii=True).encode("utf-8")
     body = b"".join(
         [
             f"--{boundary}\r\n".encode("utf-8"),
@@ -5561,35 +5834,81 @@ def insert_text_into_doc(
 
 def create_google_doc_note(title: str, body: str, image_url: str = "", image_sources: Optional[List[str]] = None) -> Dict[str, Any]:
     fast_mode = is_fast_mode_enabled()
-    token, err = resolve_docs_access_token()
-    if not token:
-        return {"ok": False, "message": err or "missing Google Docs token"}
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     quota_project = read_env_value(
         "GOOGLE_DOCS_QUOTA_PROJECT",
         read_env_value("GOOGLE_KEEP_QUOTA_PROJECT", ""),
     )
-    if quota_project:
-        headers["X-Goog-User-Project"] = quota_project
 
-    create_payload = {"title": title[:200]}
+    folder_id = resolve_docs_folder_id()
+    service_account_present = bool(load_service_account_payload(("GOOGLE_DOCS", "GOOGLE_DRIVE", "GOOGLE")))
+    token = ""
+    headers: Dict[str, str] = {}
+    document_id = ""
+    create_err = ""
+    used_drive_create = False
+    strategies = [True, False] if service_account_present else [False]
 
-    try:
-        resp = requests.post(DOCS_API_CREATE_URL, headers=headers, json=create_payload, timeout=REQUEST_TIMEOUT)
-        data = resp.json() if resp.text else {}
-    except Exception as exc:
-        return {"ok": False, "message": f"Docs create failed ({exc.__class__.__name__}: {exc})"}
+    for prefer_service_account in strategies:
+        token, err = resolve_docs_access_token(prefer_service_account=prefer_service_account)
+        if not token:
+            create_err = err or "missing Google Docs token"
+            continue
 
-    if resp.status_code >= 400:
-        detail = extract_google_api_error(data)
-        return {"ok": False, "message": f"Docs API HTTP {resp.status_code}: {detail or 'request failed'}"}
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        if quota_project:
+            headers["X-Goog-User-Project"] = quota_project
 
-    document_id = str(data.get("documentId", "")).strip() if isinstance(data, dict) else ""
+        document_id = ""
+        create_err = ""
+        used_drive_create = False
+
+        if folder_id or prefer_service_account:
+            used_drive_create = True
+            document_id, create_err = create_google_doc_file_via_drive(
+                title=title,
+                access_token=token,
+                quota_project=quota_project,
+                folder_id=folder_id,
+            )
+
+        if not document_id and not prefer_service_account:
+            create_payload = {"title": title[:200]}
+            try:
+                resp = requests.post(DOCS_API_CREATE_URL, headers=headers, json=create_payload, timeout=REQUEST_TIMEOUT)
+                data = resp.json() if resp.text else {}
+            except Exception as exc:
+                create_err = f"Docs create failed ({exc.__class__.__name__}: {exc})"
+            else:
+                if resp.status_code >= 400:
+                    detail = extract_google_api_error(data)
+                    create_err = f"Docs API HTTP {resp.status_code}: {detail or 'request failed'}"
+                else:
+                    document_id = str(data.get("documentId", "")).strip() if isinstance(data, dict) else ""
+                    if not document_id:
+                        create_err = "Docs API create response missing documentId"
+
+        if document_id:
+            break
+
     if not document_id:
-        return {"ok": False, "message": "Docs API create response missing documentId"}
+        return {"ok": False, "message": create_err or "document create failed"}
 
     doc_url = f"https://docs.google.com/document/d/{document_id}/edit"
+    if folder_id and not used_drive_create:
+        move_err = move_google_drive_file_to_folder(
+            file_id=document_id,
+            access_token=token,
+            quota_project=quota_project,
+            folder_id=folder_id,
+        )
+        if move_err:
+            return {
+                "ok": False,
+                "message": f"created, but folder move failed: {move_err}",
+                "document_id": document_id,
+                "url": doc_url,
+            }
+
     text_to_insert = body[:50000]
     if text_to_insert:
         batch_payload = {
