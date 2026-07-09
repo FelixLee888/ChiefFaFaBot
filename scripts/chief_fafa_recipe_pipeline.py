@@ -27,7 +27,7 @@ import time
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -319,6 +319,14 @@ def env_flag(name: str, default: bool = False) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+GOOGLE_DOCS_REDIRECT_URI = read_env_value("GOOGLE_DOCS_REDIRECT_URI", "http://127.0.0.1:8788/callback").strip() or "http://127.0.0.1:8788/callback"
+GOOGLE_DOCS_LOGIN_HINT = read_env_value("GOOGLE_DOCS_LOGIN_HINT", "jancefelix@gmail.com").strip() or "jancefelix@gmail.com"
+GOOGLE_DOCS_AUTH_SCOPES = (
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+)
 
 
 def is_fast_mode_enabled() -> bool:
@@ -2202,6 +2210,7 @@ def build_reply_message(
     google_doc_url: str,
     error_message: str,
     locale: str = "en",
+    extra_lines: Optional[Sequence[str]] = None,
 ) -> str:
     labels = localize_reply_line_labels(locale)
     lines: List[str] = []
@@ -2211,6 +2220,10 @@ def build_reply_message(
     clean_error = normalize_space(error_message)
     if clean_error:
         lines.append(f"{labels['error']}: {clean_error}")
+    for line in extra_lines or []:
+        clean_line = normalize_space(str(line))
+        if clean_line:
+            lines.append(clean_line)
     return "\n".join(lines)
 
 
@@ -2230,6 +2243,79 @@ def extract_first_url(text: str) -> str:
     url = match.group(0).strip()
     url = url.rstrip(").,;!?\"'")
     return url
+
+
+def google_docs_authorize_url(login_hint: str = "") -> str:
+    client_id, _client_secret = resolve_google_client_secrets()
+    if not client_id:
+        return ""
+    params = {
+        "client_id": client_id,
+        "redirect_uri": GOOGLE_DOCS_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_DOCS_AUTH_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    hint = str(login_hint or GOOGLE_DOCS_LOGIN_HINT).strip()
+    if hint:
+        params["login_hint"] = hint
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def is_google_oauth_callback_url(value: str) -> bool:
+    url = str(value or "").strip()
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.path != "/callback":
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if host not in {"127.0.0.1", "localhost"}:
+        return False
+    qs = parse_qsl(parsed.query, keep_blank_values=True)
+    data = {k: v for k, v in qs}
+    issuer = str(data.get("iss", "")).strip().lower()
+    return bool(data.get("code")) and (not issuer or "accounts.google.com" in issuer)
+
+
+def primary_env_file_path() -> Path:
+    primary = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        if primary.exists():
+            return primary
+    except OSError:
+        pass
+    for env_file in ENV_FALLBACK_FILES:
+        try:
+            if env_file.exists():
+                return env_file
+        except OSError:
+            continue
+    return primary
+
+
+def update_env_file_values(path: Path, updates: Dict[str, str]) -> None:
+    existing_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
+    out_lines: List[str] = []
+    seen: set[str] = set()
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates and str(updates[key]).strip():
+                out_lines.append(f"{key}={str(updates[key]).strip()}")
+                seen.add(key)
+                continue
+        out_lines.append(line)
+    for key, value in updates.items():
+        value_text = str(value).strip()
+        if value_text and key not in seen:
+            out_lines.append(f"{key}={value_text}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
 
 
 def normalize_image_source_ref(value: str) -> str:
@@ -5065,6 +5151,59 @@ def resolve_google_client_secrets() -> Tuple[str, str]:
     return client_id, client_secret
 
 
+def exchange_google_docs_callback_url(callback_url: str) -> Dict[str, Any]:
+    callback = str(callback_url or "").strip()
+    if not is_google_oauth_callback_url(callback):
+        return {"ok": False, "message": "Google callback URL is missing a valid authorization code."}
+
+    client_id, client_secret = resolve_google_client_secrets()
+    if not client_id or not client_secret:
+        return {"ok": False, "message": "GOOGLE_DOCS_CLIENT_ID / GOOGLE_DOCS_CLIENT_SECRET missing"}
+
+    parsed = urlparse(callback)
+    code = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("code", "").strip()
+    if not code:
+        return {"ok": False, "message": "Google callback URL is missing the code parameter."}
+
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": GOOGLE_DOCS_REDIRECT_URI,
+    }
+    try:
+        resp = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=REQUEST_TIMEOUT)
+        token_data = resp.json() if resp.text else {}
+    except Exception as exc:
+        return {"ok": False, "message": f"Google OAuth exchange failed ({exc.__class__.__name__}: {exc})"}
+
+    if resp.status_code >= 400:
+        err = str(token_data.get("error_description", "")).strip() if isinstance(token_data, dict) else ""
+        code_text = str(token_data.get("error", "")).strip() if isinstance(token_data, dict) else ""
+        return {"ok": False, "message": err or code_text or f"Google OAuth exchange HTTP {resp.status_code}"}
+
+    access_token = str(token_data.get("access_token", "")).strip() if isinstance(token_data, dict) else ""
+    refresh_token = str(token_data.get("refresh_token", "")).strip() if isinstance(token_data, dict) else ""
+    scope = str(token_data.get("scope", "")).strip() if isinstance(token_data, dict) else ""
+    if not access_token or not refresh_token:
+        return {"ok": False, "message": "Google OAuth exchange response missing access_token or refresh_token."}
+
+    update_env_file_values(
+        primary_env_file_path(),
+        {
+            "GOOGLE_DOCS_ACCESS_TOKEN": access_token,
+            "GOOGLE_DOCS_REFRESH_TOKEN": refresh_token,
+        },
+    )
+    return {
+        "ok": True,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "scope": scope,
+    }
+
+
 def resolve_docs_access_token(prefer_service_account: bool = True) -> Tuple[str, str]:
     service_err = ""
     if prefer_service_account:
@@ -5080,12 +5219,15 @@ def resolve_docs_access_token(prefer_service_account: bool = True) -> Tuple[str,
 
     refresh = read_env_value("GOOGLE_DOCS_REFRESH_TOKEN", read_env_value("GOOGLE_KEEP_REFRESH_TOKEN", ""))
     direct = read_env_value("GOOGLE_DOCS_ACCESS_TOKEN", read_env_value("GOOGLE_KEEP_ACCESS_TOKEN", ""))
+    allow_direct_after_refresh_failure = env_flag(
+        "GOOGLE_DOCS_ALLOW_DIRECT_FALLBACK_ON_REFRESH_FAILURE",
+        False,
+    )
 
     if refresh:
         client_id, client_secret = resolve_google_client_secrets()
         if not client_id or not client_secret:
-            # Fall back to direct token if available.
-            if direct:
+            if direct and allow_direct_after_refresh_failure:
                 return direct, ""
             return "", "GOOGLE_DOCS_CLIENT_ID / GOOGLE_DOCS_CLIENT_SECRET missing"
 
@@ -5097,17 +5239,23 @@ def resolve_docs_access_token(prefer_service_account: bool = True) -> Tuple[str,
         }
         try:
             resp = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            token_data = resp.json()
-            access_token = str(token_data.get("access_token", "")).strip()
-            if access_token:
-                return access_token, ""
-            refresh_error = "token refresh response missing access_token"
+            token_data = resp.json() if resp.text else {}
+            if resp.status_code >= 400:
+                refresh_code = str(token_data.get("error", "")).strip() if isinstance(token_data, dict) else ""
+                refresh_detail = str(token_data.get("error_description", "")).strip() if isinstance(token_data, dict) else ""
+                if refresh_code == "invalid_grant" and refresh_detail:
+                    refresh_error = f"Google Docs refresh token expired or revoked ({refresh_detail})"
+                else:
+                    refresh_error = refresh_detail or refresh_code or f"token refresh HTTP {resp.status_code}"
+            else:
+                access_token = str(token_data.get("access_token", "")).strip()
+                if access_token:
+                    return access_token, ""
+                refresh_error = "token refresh response missing access_token"
         except Exception as exc:
             refresh_error = f"token refresh failed ({exc.__class__.__name__}: {exc})"
 
-        # If refresh failed, try direct token as last resort.
-        if direct:
+        if direct and allow_direct_after_refresh_failure:
             return direct, ""
         return "", refresh_error
 
@@ -5117,6 +5265,27 @@ def resolve_docs_access_token(prefer_service_account: bool = True) -> Tuple[str,
     if prefer_service_account and service_err and "not configured" not in service_err.lower():
         return "", service_err
     return "", "GOOGLE_DOCS_ACCESS_TOKEN / GOOGLE_DOCS_REFRESH_TOKEN not configured"
+
+
+def google_docs_reauth_required(error_message: str) -> bool:
+    low = normalize_space(str(error_message)).casefold()
+    if not low:
+        return False
+    return (
+        "google docs refresh token expired or revoked" in low
+        or "token has been expired or revoked" in low
+        or "invalid_grant" in low
+    )
+
+
+def google_docs_reauth_extra_lines() -> List[str]:
+    auth_url = google_docs_authorize_url()
+    if not auth_url:
+        return []
+    return [
+        f"Authorize Google Docs write access: {auth_url}",
+        "After consent, reply here with the full callback URL.",
+    ]
 
 
 def extract_google_api_error(data: Any) -> str:
@@ -6530,6 +6699,95 @@ def main() -> None:
         output_dir = Path(tempfile.gettempdir()) / "chief-fafa-notes"
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    callback_url = extract_first_url(raw_source)
+    if callback_url and is_google_oauth_callback_url(callback_url):
+        exchange_result = exchange_google_docs_callback_url(callback_url)
+        smoke_result: Dict[str, Any] = {"ok": False, "message": "skipped"}
+        auth_recovery_lines = [] if bool(exchange_result.get("ok")) else google_docs_reauth_extra_lines()
+        if bool(exchange_result.get("ok")):
+            smoke_result = create_google_doc_note(
+                "Chief Fafa Google Docs auth recovery smoke test",
+                "Google Docs OAuth callback applied successfully.",
+                image_url="",
+            )
+
+        doc_status = "ok" if bool(smoke_result.get("ok")) else "failed"
+        doc_url = str(smoke_result.get("url", "")).strip()
+        if bool(exchange_result.get("ok")) and bool(smoke_result.get("ok")):
+            summary = "Google Docs authorization refreshed successfully. Chief Fafa verified document creation."
+            error_message = ""
+        elif bool(exchange_result.get("ok")):
+            summary = "Google Docs authorization refreshed, but the verification write still failed."
+            error_message = normalize_space(str(smoke_result.get("message", ""))) or "Google Doc verification failed"
+        else:
+            summary = "Google Docs authorization refresh failed."
+            error_message = normalize_space(str(exchange_result.get("message", ""))) or "Google OAuth exchange failed"
+
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        report_path = output_dir / f"{stamp}-google-docs-auth-refresh.md"
+        report_lines = [
+            f"Chief Fafa Google Docs Auth Refresh - {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            "",
+            f"Summary: {summary}",
+            f"Google Doc status: {doc_status}",
+            f"Google Doc URL: {doc_url}",
+        ]
+        if error_message:
+            report_lines.append(f"Error: {error_message}")
+        report_path.write_text("\n".join(report_lines).rstrip() + "\n", encoding="utf-8")
+        append_chief_fafa_session_memory_note(
+            [
+                f"- [{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}] auth_refresh: {summary}",
+                f"  doc_status: {doc_status}",
+                f"  doc_url: {doc_url or '(none)'}",
+                f"  report_path: {report_path}",
+                *( [f"  note: {error_message}"] if error_message else [] ),
+            ]
+        )
+
+        if args.json:
+            if args.json_brief:
+                brief = {
+                    "ok": bool(exchange_result.get("ok")) and bool(smoke_result.get("ok")),
+                    "summary": summary,
+                    "google_doc_status": doc_status,
+                    "google_doc_url": doc_url,
+                    "error_message": error_message,
+                    "reply_message": build_reply_message(
+                        summary=summary,
+                        google_doc_status=doc_status,
+                        google_doc_url=doc_url,
+                        error_message=error_message,
+                        locale=reply_locale,
+                        extra_lines=auth_recovery_lines,
+                    ),
+                    "auth": {
+                        "exchange_ok": bool(exchange_result.get("ok")),
+                        "scope": str(exchange_result.get("scope", "")).strip(),
+                    },
+                    "doc": smoke_result,
+                    "report_path": str(report_path),
+                }
+                print(json.dumps(brief, ensure_ascii=True, indent=2))
+            else:
+                print(
+                    json.dumps(
+                        {
+                            "ok": bool(exchange_result.get("ok")) and bool(smoke_result.get("ok")),
+                            "mode": "google_docs_auth_refresh",
+                            "auth": exchange_result,
+                            "doc": smoke_result,
+                            "report_path": str(report_path),
+                        },
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                )
+        else:
+            print(report_path.read_text(encoding="utf-8"))
+            print(f"Report saved: {report_path}")
+        return
+
     if args.cleanup_stale_doc_links:
         notes_dirs = [Path(p).expanduser() for p in (args.cleanup_notes_dir or []) if str(p).strip()]
         if not notes_dirs:
@@ -6937,6 +7195,9 @@ def main() -> None:
                 seen_errors.add(msg)
                 deduped_errors.append(msg)
             error_message = " | ".join(deduped_errors).strip()
+            auth_recovery_lines: List[str] = []
+            if google_docs_reauth_required(error_message):
+                auth_recovery_lines = google_docs_reauth_extra_lines()
 
             source_url_for_review = str(source.get("url", "")).strip() or initial_input_url
             if source_url_for_review and source_error:
@@ -6965,7 +7226,7 @@ def main() -> None:
                             "error",
                         ]
                     )
-                    if doc_status == "failed" or likely_processing_issue:
+                    if not google_docs_reauth_required(error_message) and (doc_status == "failed" or likely_processing_issue):
                         trigger_state = maybe_trigger_auto_review(
                             reason="pipeline_error",
                             source_url=source_url_for_review,
@@ -6999,6 +7260,7 @@ def main() -> None:
                     google_doc_url=doc_url,
                     error_message=error_message,
                     locale=reply_locale,
+                    extra_lines=auth_recovery_lines,
                 ),
                 "doc": note_result,
                 "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
