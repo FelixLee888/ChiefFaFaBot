@@ -52,8 +52,8 @@ MAX_EMBED_IMAGE_BYTES = 8 * 1024 * 1024
 DOCS_SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif"}
 TRANSCRIPT_MAX_CHARS = 24000
 VIDEO_TEXT_MAX_CHARS = 24000
-TRANSCRIPT_MODEL = "gpt-4o-mini-transcribe"
-SUMMARY_MODEL = "gpt-4o-mini"
+TRANSCRIPT_MODEL = "gpt-transcribe"
+SUMMARY_MODEL = "gpt-6-luna"
 DOC_IMAGE_MARKER = "[[CHIEF_FAFA_IMAGE_HERE]]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", flags=re.IGNORECASE)
 DATA_IMAGE_RE = re.compile(r"^data:(image/[a-z0-9.+-]+);base64,(.+)$", flags=re.IGNORECASE | re.DOTALL)
@@ -4669,7 +4669,7 @@ def call_openai_responses_json(system_prompt: str, user_prompt: str, model_overr
     if not api_key:
         return {}, "OPENAI_API_KEY missing"
 
-    model = (model_override or "").strip() or read_env_value("CHIEF_FAFA_MODEL", "gpt-5-nano")
+    model = (model_override or "").strip() or read_env_value("CHIEF_FAFA_MODEL", "gpt-5.6-luna")
     req_payload = {
         "model": model,
         "input": [
