@@ -596,6 +596,39 @@ def unique_clean_lines(items: Iterable[str], max_items: int = 220) -> List[str]:
     return out
 
 
+INGREDIENT_QUANTITY_UNIT_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?(?:/\d+(?:[.,]\d+)?)?\s*"
+    r"(?:kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cups?|pcs?|pc|"
+    r"\u514b|\u516c\u65a4|\u6beb\u5347|\u516c\u5347|\u8336\u5319|\u6e6f\u5319|\u6c64\u5319|\u5927\u5319|\u5c0f\u5319|"
+    r"\u689d|\u6761|\u96bb|\u53ea|\u500b|\u4e2a|\u7247|\u584a|\u5757|\u9846|\u9897|\u7c92)?\b",
+    flags=re.IGNORECASE,
+)
+
+
+def ingredient_identity(text: str) -> str:
+    value = normalize_space(decode_html_text(text)).casefold()
+    value = re.sub(r"\([^)]{0,100}\)", " ", value)
+    value = INGREDIENT_QUANTITY_UNIT_RE.sub(" ", value)
+    value = re.sub(r"^(?:kg|g|mg|ml|l|cc|oz|lb|lbs|tbsp|tsp|cup|cups|pc|pcs)\b", " ", value)
+    value = re.sub(r"[^a-z0-9\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", value)
+    return normalize_space(value)
+
+
+def merge_ingredient_lines(*groups: Iterable[str], max_items: int = 260) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for group in groups:
+        for line in unique_clean_lines([str(x) for x in group], max_items=max_items):
+            identity = ingredient_identity(line)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            out.append(line)
+            if len(out) >= max_items:
+                return out
+    return out
+
+
 def normalize_inline_ingredient_name(text: str) -> str:
     out = normalize_space(unescape(text or ""))
     out = re.sub(r"^[\s:：,，;；.\-–—()（）\[\]]+", "", out)
@@ -1035,7 +1068,7 @@ def extract_recipe_sections_from_text_blob(text_blob: str) -> Tuple[List[str], L
     lines = [normalize_space(x) for x in text_blob.splitlines() if normalize_space(x)]
     section_ingredients, section_steps = extract_sections_from_lines(lines)
     regex_ingredients, regex_steps = extract_sections_by_regex(text_blob)
-    ingredients = unique_clean_lines(section_ingredients + regex_ingredients, max_items=260)
+    ingredients = merge_ingredient_lines(section_ingredients, regex_ingredients, max_items=260)
     steps = unique_clean_lines(section_steps + regex_steps, max_items=320)
 
     if not ingredients:
@@ -1064,7 +1097,7 @@ def extract_recipe_sections_from_text_blob(text_blob: str) -> Tuple[List[str], L
                     break
                 if looks_like_bare_ingredient_line(cur):
                     trailing_extras.append(cur)
-            ingredients = unique_clean_lines(measured_items + trailing_extras, max_items=260)
+            ingredients = merge_ingredient_lines(measured_items, trailing_extras, max_items=260)
 
     if not steps and lines:
         synthetic_steps = [
@@ -1415,6 +1448,9 @@ WEAK_RECIPE_TITLE_EXACT = {
     "\u6a39\u85af\u7c89",
     "\u6811\u85af\u7c89",
     "\u6728\u85af\u7c89",
+    "\u8584\u529b\u7c89",
+    "\u5f37\u529b\u7c89",
+    "\u4e2d\u529b\u7c89",
     "\ubc00\uac00\ub8e8",
     "\uc300\uac00\ub8e8",
     "\uc124\ud0d5",
@@ -1472,6 +1508,12 @@ def _de_promote_title_candidate(text: str) -> str:
     out = re.sub(r"^(?:这是我|這是我|一直在用的|常用的|教你|分享|只需|只需要)+", "", out).strip()
     out = re.sub(
         r"(?:配方|食谱|食譜|做法|教程|教學|教学|完整版|視頻|视频|影片|recipe|reel|video)$",
+        "",
+        out,
+        flags=re.IGNORECASE,
+    ).strip()
+    out = re.sub(
+        r"(?:の)?(?:レシピはこちら|レシピです|食譜在這裡|食谱在这里|full recipe|recipe here)\s*[↓↑]*$",
         "",
         out,
         flags=re.IGNORECASE,
@@ -3943,7 +3985,7 @@ def extract_source_payload_from_text(raw_text: str) -> Dict[str, Any]:
             if not title:
                 title = derive_title_from_text(text)
             description = first_non_empty([description, str(ai_parsed.get("description", "")).strip()])
-            ingredients = unique_clean_lines(list(ingredients) + list(ai_parsed.get("ingredients", [])), max_items=320)
+            ingredients = merge_ingredient_lines(ai_parsed.get("ingredients", []), ingredients, max_items=320)
             steps = unique_clean_lines(list(steps) + list(ai_parsed.get("steps", [])), max_items=360)
             ai_lang = str(ai_parsed.get("language", "")).strip()
             if ai_lang and language in {"unknown", "mixed", "latin-script"}:
@@ -5149,7 +5191,7 @@ def extract_video_recipe_with_openai(
             return {
                 "title": cleanup_title_text(title),
                 "description": decode_html_text(fallback_desc),
-                "ingredients": unique_clean_lines(fallback_ings, max_items=320),
+                "ingredients": merge_ingredient_lines(fallback_ings, max_items=320),
                 "steps": unique_clean_lines(fallback_steps, max_items=360),
             }, ""
         if map_reduce_err:
@@ -5166,7 +5208,7 @@ def extract_video_recipe_with_openai(
     if map_reduce_pack:
         mr_ings = list_from_any(map_reduce_pack.get("consolidated_ingredients", []), max_items=320)
         mr_steps = list_from_any(map_reduce_pack.get("consolidated_steps", []), max_items=360)
-        ingredients = unique_clean_lines(list(ingredients) + list(mr_ings), max_items=320)
+        ingredients = merge_ingredient_lines(ingredients, mr_ings, max_items=320)
         steps = unique_clean_lines(list(steps) + list(mr_steps), max_items=360)
 
     out = {
@@ -5176,7 +5218,7 @@ def extract_video_recipe_with_openai(
             or str(map_reduce_pack.get("tldr", "")).strip()
             or str(map_reduce_pack.get("final_summary", "")).strip()
         ),
-        "ingredients": unique_clean_lines(ingredients, max_items=320),
+        "ingredients": merge_ingredient_lines(ingredients, max_items=320),
         "steps": unique_clean_lines(steps, max_items=360),
     }
     return out, ""
@@ -6624,8 +6666,10 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
     section_ingredients, section_steps = extract_sections_from_lines(text_lines)
     regex_ingredients, regex_steps = extract_sections_by_regex("\n".join(text_lines))
 
-    all_ingredients = unique_clean_lines(
-        list(recipe_fields.get("ingredients", [])) + section_ingredients + regex_ingredients,
+    all_ingredients = merge_ingredient_lines(
+        recipe_fields.get("ingredients", []),
+        section_ingredients,
+        regex_ingredients,
         max_items=260,
     )
     all_steps = unique_clean_lines(
@@ -6696,7 +6740,7 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
                 ai_steps = extract_method_like_steps_from_free_text("\n".join(ai_steps_raw), max_items=320) or ai_steps_raw
                 ai_steps = filter_instruction_like_steps(ai_steps, min_keep=3, max_items=320)
                 if ai_ingredients:
-                    all_ingredients = unique_clean_lines(ai_ingredients + list(all_ingredients), max_items=260)
+                    all_ingredients = merge_ingredient_lines(ai_ingredients, all_ingredients, max_items=260)
                 if ai_steps:
                     all_steps = unique_clean_lines(ai_steps + list(all_steps), max_items=320)
                 ai_title = cleanup_title_text(str(ai_video.get("title", "")).strip())
@@ -6710,14 +6754,14 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
         # Prefer extraction from description; only use transcript as fallback when missing.
         desc_ingredients, desc_steps = extract_recipe_sections_from_text_blob(video_description)
         desc_steps_meaningful = has_meaningful_method_steps(desc_steps)
-        all_ingredients = unique_clean_lines(list(all_ingredients) + desc_ingredients, max_items=260)
+        all_ingredients = merge_ingredient_lines(all_ingredients, desc_ingredients, max_items=260)
         all_steps = unique_clean_lines(list(all_steps) + desc_steps, max_items=320)
         steps_meaningful = has_meaningful_method_steps(all_steps)
         if video_transcript and (not all_ingredients or not steps_meaningful or not desc_steps_meaningful):
             transcript_ingredients, transcript_steps = extract_recipe_sections_from_text_blob(video_transcript)
             transcript_steps_meaningful = has_meaningful_method_steps(transcript_steps)
             if not all_ingredients:
-                all_ingredients = unique_clean_lines(list(all_ingredients) + transcript_ingredients, max_items=260)
+                all_ingredients = merge_ingredient_lines(all_ingredients, transcript_ingredients, max_items=260)
             if (not desc_steps_meaningful) and transcript_steps_meaningful:
                 all_steps = unique_clean_lines(transcript_steps, max_items=320)
                 steps_meaningful = True

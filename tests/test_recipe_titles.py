@@ -32,6 +32,7 @@ class RecipeTitleTests(unittest.TestCase):
             "糯米粉",
             "potato starch",
             "찹쌀가루",
+            "薄力粉",
             "마스카포네 크림 마스카포네 크림...",
             "樹薯粉",
         ]
@@ -67,6 +68,22 @@ class RecipeTitleTests(unittest.TestCase):
                 fallback_text="Matcha Warabi Mochi\nA soft matcha dessert made with tapioca starch.",
             ),
             "Matcha Warabi Mochi",
+        )
+
+    def test_removes_recipe_call_to_action_suffix(self):
+        self.assertEqual(
+            pipeline.short_recipe_title("濃厚マロンペーストのレシピはこちら"),
+            "濃厚マロンペースト",
+        )
+
+    def test_semantically_deduplicates_shifted_ingredients(self):
+        merged = pipeline.merge_ingredient_lines(
+            ["75g tapioca starch", "50g sugar", "2g matcha powder", "250g water"],
+            ["g tapioca starch 50g", "sugar 2g", "matcha powder 250g"],
+        )
+        self.assertEqual(
+            merged,
+            ["75g tapioca starch", "50g sugar", "2g matcha powder", "250g water"],
         )
 
 
