@@ -1377,12 +1377,63 @@ TITLE_STOP_MARKERS = [
 ]
 
 CJK_DISH_NAME_RE = re.compile(
-    r"([\u3400-\u9fffA-Za-z0-9]{1,24}(?:蛋糕|麵包|面包|吐司|餅|饼|派|塔|布丁|蛋撻|蛋挞|湯|汤|粥|飯|饭|麵|面|粉|鍋|锅|雞|鸡|牛肉|豬|猪|蝦|虾|魚|鱼|沙拉|壽司|寿司|拉麵|拉面|義大利麵|意大利面|炒飯|炒饭|炒麵|炒面|燉飯|炖饭|煲|卷|餃子|饺子|包子|糕))",
+    r"([\u3400-\u9fffA-Za-z0-9]{1,24}(?:蛋糕|麵包|面包|吐司|餅|饼|派|塔|布丁|蛋撻|蛋挞|湯|汤|粥|飯|饭|麵|面|粉|鍋|锅|雞|鸡|牛肉|豬|猪|蝦|虾|魚|鱼|沙拉|壽司|寿司|拉麵|拉面|義大利麵|意大利面|炒飯|炒饭|炒麵|炒面|燉飯|炖饭|煲|卷|餃子|饺子|包子|糕|麻糬|糰|团|丸|醬|酱|酥|粿))",
     flags=re.IGNORECASE,
 )
 
 LATIN_DISH_NAME_RE = re.compile(
-    r"([A-Za-z][A-Za-z'\- ]{1,48}(?:cake|bread|cookie|cookies|soup|stew|pasta|noodles?|dumplings?|omelette|pizza|salad|curry|sandwich|tart|pie|risotto|pancakes?|brownies?))",
+    r"([A-Za-z][A-Za-z'\- ]{1,48}(?:cake|bread|cookie|cookies|soup|stew|pasta|noodles?|dumplings?|omelette|pizza|salad|curry|sandwich|tart|pie|risotto|pancakes?|brownies?|mochi|custard|pudding|sauce|dressing|jam|ice cream))",
+    flags=re.IGNORECASE,
+)
+
+HANGUL_DISH_NAME_RE = re.compile(
+    r"([\uac00-\ud7afA-Za-z0-9 ]{1,40}(?:\ucf00\uc774\ud06c|\ube75|\ucfe0\ud0a4|\uc218\ud504|\ud30c\uc2a4\ud0c0|\uad6d\uc218|\uba74|\ub5a1|\ud06c\ub9bc|\uc18c\uc2a4|\uc0d0\ub7ec\ub4dc|\uce74\ub808|\ub9cc\ub450|\uc8fd|\ubc25|\uc804|\ucc1c|\ubcf6\uc74c))",
+    flags=re.IGNORECASE,
+)
+
+WEAK_RECIPE_TITLE_EXACT = {
+    "recipe",
+    "recipe video",
+    "cooking video",
+    "food",
+    "flour",
+    "bread flour",
+    "rice flour",
+    "tapioca flour",
+    "tapioca starch",
+    "starch",
+    "sugar",
+    "salt",
+    "cream",
+    "\u9ad8\u7b4b\u9eb5\u7c89",
+    "\u9ad8\u7b4b\u9762\u7c89",
+    "\u4e2d\u7b4b\u9eb5\u7c89",
+    "\u4e2d\u7b4b\u9762\u7c89",
+    "\u4f4e\u7b4b\u9eb5\u7c89",
+    "\u4f4e\u7b4b\u9762\u7c89",
+    "\u7c73\u7c89",
+    "\u6a39\u85af\u7c89",
+    "\u6811\u85af\u7c89",
+    "\u6728\u85af\u7c89",
+    "\ubc00\uac00\ub8e8",
+    "\uc300\uac00\ub8e8",
+    "\uc124\ud0d5",
+    "\uc18c\uae08",
+}
+
+TITLE_QUANTITY_FRAGMENT_RE = re.compile(
+    r"^(?:\u7d04|\u7ea6|about|approx(?:imately)?\.?\s*)?\s*\d+(?:[./]\d+)?\s*"
+    r"(?:g|kg|mg|ml|l|oz|lb|tbsp|tsp|cups?|pcs?|\u514b|\u516c\u65a4|\u6beb\u5347|\u8336\u5319|\u6e6f\u5319|\u6c64\u5319|\u5927\u5319|\u5c0f\u5319|\u500b|\u4e2a|\u7247|\u9846|\u9897|\u6e6f|\u6c64)?$",
+    flags=re.IGNORECASE,
+)
+
+WEAK_INGREDIENT_TITLE_RE = re.compile(
+    r"^(?:"
+    r"(?:\u9ad8\u7b4b|\u4e2d\u7b4b|\u4f4e\u7b4b|\u7cef\u7c73|\u7c98\u7c73|\u6a39\u85af|\u6811\u85af|\u6728\u85af|\u7389\u7c73|\u99ac\u9234\u85af|\u9a6c\u94c3\u85af|\u756a\u85af|\u5730\u74dc)?"
+    r"(?:\u9eb5|\u9762|\u7c73|\u6fb1|\u6dc0)?\u7c89|"
+    r"[a-z][a-z '\-]{0,36}(?:flour|starch|sugar|salt|butter|oil)|"
+    r"[\uac00-\ud7af ]{1,30}(?:\uac00\ub8e8|\uc124\ud0d5|\uc18c\uae08|\ubc84\ud130|\uae30\ub984)"
+    r")$",
     flags=re.IGNORECASE,
 )
 
@@ -1476,8 +1527,10 @@ def short_recipe_title(title: str, fallback_text: str = "") -> str:
         if len(candidate) > 48:
             continue
         score = 0
-        if CJK_DISH_NAME_RE.search(candidate) or LATIN_DISH_NAME_RE.search(candidate):
+        if CJK_DISH_NAME_RE.search(candidate) or LATIN_DISH_NAME_RE.search(candidate) or HANGUL_DISH_NAME_RE.search(candidate):
             score += 120
+        if title_looks_generic(candidate):
+            score -= 160
         if len(candidate) <= 20:
             score += 18
         elif len(candidate) <= 28:
@@ -1499,8 +1552,19 @@ def short_recipe_title(title: str, fallback_text: str = "") -> str:
 
 
 def title_looks_generic(title: str) -> bool:
-    low = title.casefold().strip()
+    clean = cleanup_title_text(title)
+    low = clean.casefold().strip()
     if not low:
+        return True
+    if low in WEAK_RECIPE_TITLE_EXACT:
+        return True
+    if re.fullmatch(r"@[a-z0-9._-]+", low):
+        return True
+    if TITLE_QUANTITY_FRAGMENT_RE.fullmatch(low):
+        return True
+    if WEAK_INGREDIENT_TITLE_RE.fullmatch(low):
+        return True
+    if low.endswith(("...", "\u2026")):
         return True
     generic_prefixes = [
         "video by ",
@@ -1514,7 +1578,57 @@ def title_looks_generic(title: str) -> bool:
         return True
     if low.endswith(" on instagram"):
         return True
+    tokens = re.findall(r"[a-z0-9\uac00-\ud7af]+", low)
+    if len(tokens) >= 3:
+        unique_ratio = len(set(tokens)) / len(tokens)
+        if unique_ratio <= 0.6:
+            return True
+    if re.search(r"(?:^|\s)@[a-z0-9._-]+(?:\s|$)", low) and len(tokens) <= 4:
+        return True
     return False
+
+
+def recipe_title_quality(title: str) -> int:
+    clean = cleanup_title_text(title)
+    if not clean:
+        return -200
+
+    score = 0
+    if title_looks_generic(clean):
+        score -= 120
+    if CJK_DISH_NAME_RE.search(clean) or LATIN_DISH_NAME_RE.search(clean) or HANGUL_DISH_NAME_RE.search(clean):
+        score += 80
+
+    visible_len = len(re.sub(r"\s+", "", clean))
+    if 4 <= visible_len <= 36:
+        score += 24
+    elif visible_len > 64:
+        score -= 24
+    elif visible_len < 2:
+        score -= 40
+
+    if re.search(r"[#@]|https?://", clean, flags=re.IGNORECASE):
+        score -= 30
+    if re.search(r"\d", clean) and not re.search(r"[A-Za-z\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", clean):
+        score -= 50
+    return score
+
+
+def choose_better_recipe_title(primary: str, alternative: str) -> str:
+    current = cleanup_title_text(primary)
+    candidate = cleanup_title_text(alternative)
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+
+    current_score = recipe_title_quality(current)
+    candidate_score = recipe_title_quality(candidate)
+    if candidate_score >= current_score + 15:
+        return candidate
+    if title_looks_generic(current) and not title_looks_generic(candidate):
+        return candidate
+    return current
 
 
 def derive_title_from_text(text: str) -> str:
@@ -3820,11 +3934,14 @@ def extract_source_payload_from_text(raw_text: str) -> Dict[str, Any]:
         break
 
     ai_parse_note = ""
-    need_ai_parse = (not title) or (not ingredients) or (not steps)
+    need_ai_parse = (not title) or title_looks_generic(title) or (not ingredients) or (not steps)
     if need_ai_parse:
         ai_parsed, ai_err = extract_text_recipe_with_openai(text, language)
         if ai_parsed:
-            title = first_non_empty([title, str(ai_parsed.get("title", "")).strip(), derive_title_from_text(text)])
+            ai_title = str(ai_parsed.get("title", "")).strip()
+            title = choose_better_recipe_title(title, ai_title)
+            if not title:
+                title = derive_title_from_text(text)
             description = first_non_empty([description, str(ai_parsed.get("description", "")).strip()])
             ingredients = unique_clean_lines(list(ingredients) + list(ai_parsed.get("ingredients", [])), max_items=320)
             steps = unique_clean_lines(list(steps) + list(ai_parsed.get("steps", [])), max_items=360)
@@ -3838,7 +3955,7 @@ def extract_source_payload_from_text(raw_text: str) -> Dict[str, Any]:
         title = derive_title_from_text(text)
 
     missing: List[str] = []
-    if not title:
+    if not title or title_looks_generic(title):
         missing.append("recipe_name")
     if not ingredients:
         missing.append("ingredients")
@@ -4881,6 +4998,9 @@ def extract_text_recipe_with_openai(raw_text: str, language_hint: str) -> Tuple[
     system_prompt = (
         "You extract structured recipe data from free-form user text in ANY language. "
         "Do not translate. Keep original language wording. "
+        "The title must name the finished dish, not a single ingredient, quantity/unit fragment, "
+        "social-media handle, author, platform label, or promotional caption. Infer a concise, specific "
+        "dish name from the ingredients and method when the source title is weak. "
         "Return strict JSON object with keys: "
         "title (string), description (string), language (string), ingredients (array of strings), steps (array of strings)."
     )
@@ -4909,6 +5029,45 @@ def extract_text_recipe_with_openai(raw_text: str, language_hint: str) -> Tuple[
         "steps": steps,
     }
     return out, ""
+
+
+def refine_weak_recipe_title_with_openai(
+    current_title: str,
+    description: str,
+    ingredients: List[str],
+    steps: List[str],
+    language_hint: str,
+) -> Tuple[str, str]:
+    if not title_looks_generic(current_title):
+        return cleanup_title_text(current_title), ""
+    if not read_env_value("OPENAI_API_KEY", ""):
+        return cleanup_title_text(current_title), "OPENAI_API_KEY missing"
+
+    evidence = {
+        "current_title": cleanup_title_text(current_title),
+        "description": decode_html_text(description)[:1800],
+        "ingredients": [str(x)[:180] for x in ingredients[:40]],
+        "steps": [str(x)[:240] for x in steps[:30]],
+        "language_hint": language_hint or "unknown",
+    }
+    system_prompt = (
+        "Identify the finished recipe dish from the supplied evidence. Return JSON with one key: title. "
+        "Use the source's dominant language and write a concise, specific dish name. The title must describe "
+        "what is cooked or served, not merely an ingredient, flour/starch type, amount, unit, handle, author, "
+        "platform label, promotional phrase, repeated words, or truncated caption. Do not invent unsupported flavors."
+    )
+    parsed, err = call_openai_responses_json(
+        system_prompt,
+        "Recipe evidence:\n" + json.dumps(evidence, ensure_ascii=False),
+    )
+    if err:
+        return cleanup_title_text(current_title), err
+
+    candidate = cleanup_title_text(str(parsed.get("title", "")).strip())
+    chosen = choose_better_recipe_title(current_title, candidate)
+    if title_looks_generic(chosen):
+        return cleanup_title_text(current_title), "model did not produce a specific dish title"
+    return chosen, ""
 
 
 def extract_video_recipe_with_openai(
@@ -4960,6 +5119,9 @@ def extract_video_recipe_with_openai(
         "You extract structured recipe data from video metadata/transcript in ANY language. "
         "Prefer the dominant source language indicated by language_hint; avoid unnecessary language switching. "
         "Do not translate unless the source itself is clearly bilingual. Preserve original wording and units. "
+        "The title must be a concise, specific name for the finished dish. Never use only an ingredient, "
+        "an amount/unit fragment, a social-media handle, an author name, a platform label, repeated caption text, "
+        "or a truncated sentence. Infer the dish from the ingredients and cooking method when metadata is weak. "
         "Return strict JSON object with keys: title (string), description (string), "
         "ingredients (array of strings), steps (array of strings). "
         "Only include ingredients/steps supported by the provided text. "
@@ -6538,8 +6700,7 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
                 if ai_steps:
                     all_steps = unique_clean_lines(ai_steps + list(all_steps), max_items=320)
                 ai_title = cleanup_title_text(str(ai_video.get("title", "")).strip())
-                if ai_title and (not title or title_looks_generic(title)):
-                    title = ai_title
+                title = choose_better_recipe_title(title, ai_title)
                 ai_desc = decode_html_text(str(ai_video.get("description", "")).strip())
                 if ai_desc and not has_meaningful_text(video_description, min_chars=28):
                     video_description = ai_desc
@@ -6599,7 +6760,17 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
     if title_looks_generic(title):
         fallback_title = derive_title_from_text("\n".join([video_description, video_transcript, description, text_excerpt]))
         if fallback_title:
-            title = refine_title_for_content_language(fallback_title, context_text) or fallback_title
+            fallback_title = refine_title_for_content_language(fallback_title, context_text) or fallback_title
+            title = choose_better_recipe_title(title, fallback_title)
+    if title_looks_generic(title) and (all_ingredients or all_steps):
+        refined_title, _ = refine_weak_recipe_title_with_openai(
+            current_title=title,
+            description=description,
+            ingredients=all_ingredients,
+            steps=all_steps,
+            language_hint=dominant_script_group(context_text),
+        )
+        title = choose_better_recipe_title(title, refined_title)
     title = short_recipe_title(title, fallback_text=context_text)
 
     if "instagram.com" in domain and " on Instagram" in title:
